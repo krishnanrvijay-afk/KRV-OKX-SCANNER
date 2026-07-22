@@ -1,0 +1,1318 @@
+import asyncio
+import time
+import logging
+from datetime import datetime, timezone, timedelta
+from typing import Optional
+import os as _os
+
+from config import (
+    PAIRS, J15M_SHORT_GATE, J15M_LONG_GATE, J1H_SHORT_MIN, J1H_SHORT_MAX, J1H_LONG_MIN, J1H_LONG_MAX,
+    RSI15M_SHORT_MIN, RSI15M_LONG_MAX, DEPTH_GATE_PCT, ATR_SL_MULTIPLIER,
+    TP1_R, TP1_CLOSE_PCT, TP2_R, LEVERAGE,
+    ADX_MIN_LONG, ADX_MIN_SHORT, PAPER_MODE, CONSECUTIVE_LOSS_STOP,
+    MIN_SL_PCT, MIN_SL_PCT_DEFAULT, MARGIN_PER_TRADE,
+    J15M_SHORT_CEILING, J15M_LONG_FLOOR,
+    PAIR_COOLDOWN_SECONDS,
+    KILL_PCT_FLOOR,
+    SE_J1H_DECAY_PTS,
+    BLOCKED_PAIR_SESSIONS,
+    SESSION_FILTER_ENABLED,
+    CONVERGENCE_GATE_ENABLED,
+)
+
+# ── Configurable via settings overlay (main.py sets these at runtime) ──────
+J5M_SHORT_MIN   = 88.0   # j5m must exceed this for SHORT bounce signal
+J5M_LONG_MAX    = 20.0   # j5m must be below this for LONG bounce signal
+DEPTH_SHORT_MIN = 45.0   # ask_pct must meet or exceed this for SHORT entry
+DEPTH_LONG_MIN  = 50.0   # bid_pct must meet or exceed this for LONG entry
+
+log = logging.getLogger("scanner")
+
+# -- Supabase gate logging (fire-and-forget, never blocks entry) --
+_SB_URL: str = _os.environ.get("SUPABASE_URL", "").rstrip("/")
+_SB_KEY: str = _os.environ.get("SUPABASE_KEY", "")
+
+async def _log_gate(venue: str, pair: str, gate_type: str, direction: str, reason: str) -> None:
+    if not _SB_URL or not _SB_KEY:
+        return
+    try:
+        import httpx as _httpx
+        async with _httpx.AsyncClient(timeout=3.0) as _c:
+            await _c.post(
+                f"{_SB_URL}/rest/v1/gate_activity_log",
+                headers={
+                    "apikey": _SB_KEY,
+                    "Authorization": f"Bearer {_SB_KEY}",
+                    "Content-Type": "application/json",
+                    "Prefer": "return=minimal",
+                },
+                json={"venue": venue, "pair": pair, "gate_type": gate_type,
+                      "direction": direction, "reason": reason},
+            )
+    except Exception:
+        pass
+
+# ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ Module-level state ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
+
+_last_stoch:  dict[str, tuple] = {}   # keyed symbol -> (stoch_k, stoch_d) from previous scan
+_last_stoch_fast: dict[str, tuple] = {}   # keyed symbol -> (stoch_k_fast, stoch_d_fast) 8,3,3
+_adverse_cluster: dict = {"long": [], "short": []}  # rolling adverse exit timestamps per direction
+_consec_adverse:  dict = {"long": 0,  "short": 0}   # consecutive KILL/DEAD_TRADE_KILL counter per direction
+_adverse_cooldown_until: dict = {"long": None, "short": None}  # graduated adverse cooldown expiry per direction
+_btc_flash_block_until: dict = {"long": None}                  # expiry for BTC 1m flash crash LONG block
+_flash_closed: set = set()                                      # trade keys already force-closed this flash event
+_btc_flash_tg_pending = [False]                                 # set True when flash arms; cleared in main.py after TG sent
+_cooldowns:   dict[str, float] = {}   # keyed "BTCSHORT" / "BTCLONG" ÃÂ¢ÃÂÃÂ expiry ts
+_pair_cooldowns: dict           = {}   # keyed symbol -> expiry ts
+_bypass_cooldowns: dict[str, float] = {}  # keyed "SYMBOLLONG" -> expiry ts (bypass re-entry timer)
+BYPASS_COOLDOWN_SECONDS: int = 1800        # 30 min re-entry timer after any bypass LONG fires
+BYPASS_J15M_MAX: float = 20.0              # J15M must be < this for bypass LONGs (tighter gate during BTC LONG_BLOCKED)
+BYPASS_J15M_SHORT_MIN: float = 80.0        # J15M must be > this for bypass SHORTs (tighter gate during BTC SHORT_BLOCKED)
+_scan_count:  int              = 0
+_fleet_halt:  bool             = False  # set by fleet-scorecard halt API via Supabase
+_stale_prices: set[str]        = set()  # symbols with 2 consecutive missing prices
+_stale_counts: dict             = {}     # consecutive no-price count per symbol
+_candle_cache: dict             = {}     # "SYMBOL_tf" -> (candles, expires_at_epoch)
+_btc_j1h: float = 50.0   # cached BTC J1H ÃÂ¢ÃÂÃÂ updated each scan when BTC is processed
+_btc_j1h_history: list = []  # Tracks last 12 BTC J1H values
+_conv_gate_short: bool = False   # set by main.py from local sentinel; True = 55%+ pairs overbought
+_conv_gate_long:  bool = False   # set by main.py from local sentinel; True = 55%+ pairs oversold — ~10-15 minutes of macro trend
+
+# ── Dual-mode regime state (updated every BTC scan) ──────────────────────────
+_regime:              str   = "RANGING"  # BULL_TREND / BEAR_TREND / RANGING
+_regime_confidence:   str   = "HIGH"     # HIGH / MEDIUM / LOW
+_btc_momentum_5c:     float = 0.0        # sum of last 5 closed BTC 1m candle bodies (pts)
+_btc_candle_velocity: float = 0.0        # BTC current candle body (close - open, pts)
+_regime_last_push:    float = 0.0        # epoch of last venue_live_state Supabase push
+
+BTC_CORRELATION: dict[str, float] = {
+    "ETH": 0.94, "SOL": 0.86, "XRP": 0.84, "DOGE": 0.87,
+    "LINK": 0.82, "AVAX": 0.80, "SUI": 0.82, "NEAR": 0.78,
+    "WIF": 0.65, "HYPE": 0.50, "ZEC": 0.40, "ARB": 0.78, "LINK": 0.80,
+}
+
+
+# ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ Indicator helpers ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
+
+def _cache_get(symbol: str, tf: str):
+    """Return cached candles if TTL not expired, else None."""
+    entry = _candle_cache.get(f"{symbol}_{tf}")
+    if entry and time.time() < entry[1]:
+        return entry[0]
+    return None
+
+
+def _cache_set(symbol: str, tf: str, candles: list, ttl: int) -> None:
+    _candle_cache[f"{symbol}_{tf}"] = (candles, time.time() + ttl)
+
+
+def _compute_kdj(candles: list[dict], period: int = 9) -> tuple[float, float, float]:
+    if len(candles) < period:
+        return 50.0, 50.0, 50.0
+    closes = [c["close"] for c in candles]
+    highs  = [c["high"]  for c in candles]
+    lows   = [c["low"]   for c in candles]
+    K, D = 50.0, 50.0
+    for i in range(len(closes)):
+        if i < period - 1:
+            continue
+        h_n = max(highs[i - period + 1 : i + 1])
+        l_n = min(lows[i  - period + 1 : i + 1])
+        rsv = (closes[i] - l_n) / (h_n - l_n) * 100 if h_n != l_n else 50.0
+        K   = 2 / 3 * K + 1 / 3 * rsv
+        D   = 2 / 3 * D + 1 / 3 * K
+    J = 3 * K - 2 * D
+    return K, D, max(0.0, min(100.0, J))
+
+
+def _compute_regime(j1h: float, momentum_5c: float, velocity: float) -> tuple:
+    """Classify BTC macro regime from J1H, 5-candle body sum, and current candle velocity.
+    BULL_TREND: j1h>60 AND momentum_5c>100 AND velocity>0
+    BEAR_TREND: j1h<40 AND momentum_5c<-100 AND velocity<0
+    RANGING:    everything else
+    """
+    bull = j1h > 60 and momentum_5c > 100 and velocity > 0
+    bear = j1h < 40 and momentum_5c < -100 and velocity < 0
+    if bull:
+        conf = "HIGH" if j1h > 65 and momentum_5c > 150 else "MEDIUM"
+        return "BULL_TREND", conf
+    if bear:
+        conf = "HIGH" if j1h < 35 and momentum_5c < -150 else "MEDIUM"
+        return "BEAR_TREND", conf
+    return "RANGING", "HIGH"
+
+
+async def _push_venue_live_state(venue: str, regime: str, confidence: str,
+                                  j1h: float, momentum_5c: float, vel: float) -> None:
+    """Fire-and-forget: write regime snapshot to Supabase venue_live_state (upsert)."""
+    if not _SB_URL or not _SB_KEY:
+        return
+    try:
+        import httpx as _httpx
+        from datetime import datetime, timezone as _tz
+        async with _httpx.AsyncClient(timeout=3.0) as _c:
+            await _c.post(
+                f"{_SB_URL}/rest/v1/venue_live_state",
+                headers={
+                    "apikey": _SB_KEY,
+                    "Authorization": f"Bearer {_SB_KEY}",
+                    "Content-Type": "application/json",
+                    "Prefer": "resolution=merge-duplicates,return=minimal",
+                },
+                json={
+                    "venue": venue,
+                    "regime": regime,
+                    "regime_confidence": confidence,
+                    "btc_j1h": round(j1h, 1),
+                    "btc_momentum_5c": round(momentum_5c, 1),
+                    "btc_candle_velocity": round(vel, 1),
+                    "updated_at": datetime.now(_tz.utc).isoformat(),
+                },
+            )
+    except Exception:
+        pass
+
+
+def _compute_rsi(candles: list[dict], period: int = 14) -> float:
+    closes = [c["close"] for c in candles]
+    if len(closes) < period + 1:
+        return 50.0
+    gains, losses = [], []
+    for i in range(1, len(closes)):
+        d = closes[i] - closes[i - 1]
+        gains.append(max(0.0, d))
+        losses.append(max(0.0, -d))
+    avg_g = sum(gains[:period]) / period
+    avg_l = sum(losses[:period]) / period
+    for i in range(period, len(gains)):
+        avg_g = (avg_g * (period - 1) + gains[i]) / period
+        avg_l = (avg_l * (period - 1) + losses[i]) / period
+    if avg_l == 0:
+        return 100.0
+    return 100 - 100 / (1 + avg_g / avg_l)
+
+
+def _compute_stochastic(candles: list[dict], k_period: int = 14, slow_period: int = 3, d_period: int = 3) -> tuple[float, float]:
+    """Standard slow stochastic 14,3,3. Returns (%K slow, %D)."""
+    if len(candles) < k_period:
+        return 50.0, 50.0
+    closes = [c["close"] for c in candles]
+    highs  = [c["high"]  for c in candles]
+    lows   = [c["low"]   for c in candles]
+    k_raws = []
+    for i in range(k_period - 1, len(candles)):
+        h_n   = max(highs[i - k_period + 1 : i + 1])
+        l_n   = min(lows[i  - k_period + 1 : i + 1])
+        k_raw = (closes[i] - l_n) / (h_n - l_n) * 100 if h_n != l_n else 50.0
+        k_raws.append(k_raw)
+    if len(k_raws) < slow_period:
+        return 50.0, 50.0
+    k_slows = []
+    for i in range(slow_period - 1, len(k_raws)):
+        k_slows.append(sum(k_raws[i - slow_period + 1 : i + 1]) / slow_period)
+    if len(k_slows) < d_period:
+        return (round(k_slows[-1], 2) if k_slows else 50.0), 50.0
+    return round(k_slows[-1], 2), round(sum(k_slows[-d_period:]) / d_period, 2)
+
+
+def _compute_atr(candles: list[dict], period: int = 14) -> float:
+    if len(candles) < 2:
+        return 0.0
+    trs = []
+    for i in range(1, len(candles)):
+        h, l, pc = candles[i]["high"], candles[i]["low"], candles[i - 1]["close"]
+        trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+    if not trs:
+        return 0.0
+    atr = sum(trs[:period]) / min(period, len(trs))
+    for i in range(period, len(trs)):
+        atr = (atr * (period - 1) + trs[i]) / period
+    return atr
+
+
+def _compute_adx(candles: list[dict], period: int = 14) -> float:
+    if len(candles) < period + 1:
+        return 0.0
+    plus_dms, minus_dms, trs = [], [], []
+    for i in range(1, len(candles)):
+        up   = candles[i]["high"]  - candles[i - 1]["high"]
+        down = candles[i - 1]["low"] - candles[i]["low"]
+        plus_dms.append(max(0.0, up)   if up   > down else 0.0)
+        minus_dms.append(max(0.0, down) if down > up   else 0.0)
+        h, l, pc = candles[i]["high"], candles[i]["low"], candles[i - 1]["close"]
+        trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+    if len(trs) < period:
+        return 0.0
+    atr_s  = sum(trs[:period])
+    pdm_s  = sum(plus_dms[:period])
+    mdm_s  = sum(minus_dms[:period])
+    dxs    = []
+    for i in range(period, len(trs)):
+        atr_s  = atr_s  - atr_s  / period + trs[i]
+        pdm_s  = pdm_s  - pdm_s  / period + plus_dms[i]
+        mdm_s  = mdm_s  - mdm_s  / period + minus_dms[i]
+        if atr_s == 0:
+            continue
+        pdi = pdm_s / atr_s * 100
+        mdi = mdm_s / atr_s * 100
+        dxs.append(abs(pdi - mdi) / (pdi + mdi) * 100 if pdi + mdi else 0.0)
+    if not dxs:
+        return 0.0
+    adx = sum(dxs[:period]) / min(period, len(dxs))
+    for dx in dxs[period:]:
+        adx = (adx * (period - 1) + dx) / period
+    return adx
+
+
+def _compute_ma(candles: list[dict], period: int) -> Optional[float]:
+    closes = [c["close"] for c in candles]
+    if len(closes) < period:
+        return None
+    return sum(closes[-period:]) / period
+
+
+def _trend_from_ma(price: float, candles_5m: list, candles_15m: list, candles_1h: list, adx_1h: float = 0.0) -> str:
+    """1H-anchored trend: 1H is primary anchor; 15M/5M add conviction but cannot override."""
+    def _vote(candles: list, p: float) -> str:
+        ma5  = _compute_ma(candles, 5)
+        ma10 = _compute_ma(candles, 10)
+        ma30 = _compute_ma(candles, 30)
+        if ma5 and ma10 and ma30:
+            if ma5 > ma10 > ma30 and p > ma10:
+                return "BULL"
+            if ma5 < ma10 < ma30 and p < ma10:
+                return "BEAR"
+        return "NEUTRAL"
+    v5m  = _vote(candles_5m,  price)
+    v15m = _vote(candles_15m, price)
+    v1h  = _vote(candles_1h,  price)
+    if v1h == "BEAR" and v15m == "BEAR" and v5m == "BEAR" and adx_1h >= 25:
+        return "Strong Bear"
+    if v1h == "BEAR" and v15m == "BEAR":
+        return "Strong Bear"
+    if v1h == "BEAR":
+        return "Bearish"
+    if v1h == "BULL" and v15m == "BULL" and v5m == "BULL" and adx_1h >= 25:
+        return "Strong Bull"
+    if v1h == "BULL" and v15m == "BULL":
+        return "Strong Bull"
+    if v1h == "BULL":
+        return "Bullish"
+    if v15m == "BEAR" and v5m == "BEAR":
+        return "Bearish"
+    if v15m == "BULL" and v5m == "BULL":
+        return "Bullish"
+    return "Neutral"
+
+
+def _depth_pcts(book: dict) -> tuple[float, float]:
+    bids = book.get("bids", [])
+    asks = book.get("asks", [])
+    bid_vol = sum(b["sz"] for b in bids)
+    ask_vol = sum(a["sz"] for a in asks)
+    total   = bid_vol + ask_vol
+    if total == 0:
+        return 50.0, 50.0
+    return round(bid_vol / total * 100, 1), round(ask_vol / total * 100, 1)
+
+
+# ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ Scoring ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
+
+
+
+def _find_book_wall(levels: list, price: float, is_bid: bool):
+    """Return the dominant wall if one exists: largest sz >= 3x avg within 1% of price.
+    is_bid=True  -> bids  (SHORT exit target: a large buy wall price is approaching).
+    is_bid=False -> asks  (LONG  exit target: a large sell wall price is approaching).
+    Returns dict {price, size, dist_pct, ratio} or None."""
+    if not levels or len(levels) < 2 or not price:
+        return None
+    sizes = [lvl["sz"] for lvl in levels]
+    avg = sum(sizes) / len(sizes)
+    if avg <= 0:
+        return None
+    max_sz = max(sizes)
+    if max_sz < 3 * avg:
+        return None
+    mi = sizes.index(max_sz)
+    wall_px = levels[mi]["px"]
+    dist_pct = ((price - wall_px) / price * 100 if is_bid
+                else (wall_px - price) / price * 100)
+    if dist_pct < 0 or dist_pct > 1.0:
+        return None
+    return {
+        "price":    wall_px,
+        "size":     round(max_sz, 3),
+        "dist_pct": round(dist_pct, 4),
+        "ratio":    round(max_sz / avg, 1),
+    }
+
+def check_bounce_short(j15m: float, ask_pct: float, j5m: float) -> bool:
+    """Return True when all hard entry gates pass for a SHORT bounce signal."""
+    stoch_gate = (j5m > J5M_SHORT_MIN and j15m > J15M_SHORT_GATE)
+    return stoch_gate and (ask_pct >= DEPTH_SHORT_MIN)
+
+
+def check_bounce_long(j15m: float, bid_pct: float, j5m: float) -> bool:
+    """Return True when all hard entry gates pass for a LONG bounce signal."""
+    stoch_gate = (j5m < J5M_LONG_MAX and j15m < J15M_LONG_GATE)
+    return stoch_gate and (bid_pct >= DEPTH_LONG_MIN)
+
+
+# ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ Cooldown helpers ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
+
+def set_close_cooldown(
+        symbol: str,
+        direction: str,
+        seconds: int = None):
+    _secs = (seconds if seconds is not None
+             else PAIR_COOLDOWN_SECONDS)
+    _cooldowns[
+        f"{symbol}{direction}"] = (
+        time.time() + _secs)
+
+
+def get_cooldown_remaining(symbol: str, direction: str) -> int:
+    exp = _cooldowns.get(f"{symbol}{direction}", 0)
+    return max(0, int(exp - time.time()))
+
+
+def clear_cooldown(symbol: str, direction: str):
+    _cooldowns.pop(f"{symbol}{direction}", None)
+
+
+def get_scan_count() -> int:
+    return _scan_count
+
+
+def clear_all_scanner_state():
+    global _scan_count
+    _last_stoch.clear()
+    _last_stoch_fast.clear()
+    _cooldowns.clear()
+    _scan_count = 0
+
+
+def get_session_name() -> str:
+    """Return current trading session name based on UTC hour."""
+    h = datetime.now(timezone.utc).hour
+    if h >= 17 or h < 8:  return "ASIA"
+    if 8  <= h < 12:       return "EU"
+    if 12 <= h < 17:       return "US"
+    return "OFF"
+
+
+def get_session_sl_buffer() -> float:
+    """Additional SL buffer (fraction of price) added by session."""
+    s = get_session_name()
+    if s == "ASIA": return 0.003
+    if s == "EU":   return 0.001
+    return 0.0
+
+
+def compute_market_health(pair_states: list[dict], recent_trades: list[dict]) -> dict:
+    """Aggregate market-wide health; returns RUN/CAUTION/HALT per direction."""
+    total = len(pair_states)
+    if total == 0:
+        return {
+            "short_status": "CAUTION", "long_status": "CAUTION",
+            "bear_count": 0, "bull_count": 0, "total": 0,
+            "bear_ratio": 0.0, "bull_ratio": 0.0,
+            "avg_adx": 0.0, "avg_j5": 50.0, "sl_rate": 0.0,
+        }
+    bear_count = sum(1 for s in pair_states if s.get("trend") in ("Bearish", "Strong Bear"))
+    bull_count = sum(1 for s in pair_states if s.get("trend") in ("Bullish", "Strong Bull"))
+    bear_ratio = bear_count / total
+    bull_ratio = bull_count / total
+    adx_vals   = [s["adx1h"] for s in pair_states if s.get("adx1h") is not None]
+    j5_vals    = [s["j5m"]   for s in pair_states if s.get("j5m")  is not None]
+    avg_adx    = sum(adx_vals) / len(adx_vals) if adx_vals else 0.0
+    avg_j5     = sum(j5_vals)  / len(j5_vals)  if j5_vals  else 50.0
+    recent6    = [t for t in recent_trades
+                  if (t.get("close_reason") or t.get("exit_reason"))][-6:]
+    sl_rate    = (
+        sum(1 for t in recent6
+            if (t.get("close_reason") or t.get("exit_reason") or "").upper().startswith("SL"))
+        / len(recent6)
+    ) if recent6 else 0.0
+    if bear_ratio >= 0.6 and avg_adx >= 35 and avg_j5 <= 70 and sl_rate < 0.4:
+        short_status = "RUN"
+    elif bear_ratio < 0.3 or sl_rate >= 0.6 or (avg_j5 >= 85 and bear_ratio < 0.5):
+        short_status = "HALT"
+    else:
+        short_status = "CAUTION"
+    if bull_ratio >= 0.6 and avg_adx >= 35 and avg_j5 >= 30 and sl_rate < 0.4:
+        long_status = "RUN"
+    elif bull_ratio < 0.3 or sl_rate >= 0.6 or (avg_j5 <= 15 and bull_ratio < 0.5):
+        long_status = "HALT"
+    else:
+        long_status = "CAUTION"
+    return {
+        "short_status": short_status,
+        "long_status":  long_status,
+        "bear_count":   bear_count,
+        "bull_count":   bull_count,
+        "total":        total,
+        "bear_ratio":   round(bear_ratio, 3),
+        "bull_ratio":   round(bull_ratio, 3),
+        "avg_adx":      round(avg_adx, 1),
+        "avg_j5":       round(avg_j5, 1),
+        "sl_rate":      round(sl_rate, 3),
+    }
+
+
+# ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ Main scan ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
+
+async def run_full_scan(bybit_client, market_health: Optional[dict] = None, open_trades: dict = None) -> list[dict]:
+    global _scan_count
+    global _fleet_halt
+    _open_trades_ref = open_trades if open_trades is not None else {}
+
+    _scan_count += 1
+    if _scan_count < 2:
+        print(
+            f"[WARMUP] scan "
+            f"#{_scan_count}/2 — "
+            f"KDJ initializing, "
+            f"skipping signal "
+            f"evaluation")
+        return [], []
+
+    # Fleet halt check
+    # Reads from scanner state
+    # Takes effect within one
+    # scan cycle (~30 seconds)
+    if _SB_URL and _SB_KEY:
+        try:
+            import httpx as _httpx
+            async with _httpx.AsyncClient(timeout=2.0) as _hc:
+                _fh = await _hc.get(
+                    f"{_SB_URL}/rest/v1/hl_scanner_state",
+                    params={"select": "fleet_halt",
+                            "id": "eq.1",
+                            "limit": "1"},
+                    headers={"apikey": _SB_KEY,
+                             "Authorization": f"Bearer {_SB_KEY}"},
+                )
+                if _fh.status_code == 200 and _fh.json():
+                    _fleet_halt = bool(
+                        _fh.json()[0].get(
+                            "fleet_halt", False))
+        except Exception:
+            pass
+    # -- Directional halt toggles: halt_long / halt_short --
+    _fleet_halt_long  = False
+    _fleet_halt_short = False
+    if _SB_URL and _SB_KEY:
+        try:
+            import httpx as _httpx_dh
+            async with _httpx_dh.AsyncClient(timeout=2.0) as _hc_dh:
+                _dh = await _hc_dh.get(
+                    f"{_SB_URL}/rest/v1/hl_scanner_state",
+                    params={"select": "halt_long,halt_short",
+                            "id": "eq.1", "limit": "1"},
+                    headers={"apikey": _SB_KEY,
+                             "Authorization": f"Bearer {_SB_KEY}"},
+                )
+                if _dh.status_code == 200 and _dh.json():
+                    _fleet_halt_long  = bool(_dh.json()[0].get("halt_long",  False))
+                    _fleet_halt_short = bool(_dh.json()[0].get("halt_short", False))
+        except Exception:
+            pass
+    if _fleet_halt:
+        log.info(
+            "[FLEET HALT] active"
+            " — signal generation"
+            " suspended")
+        return [], []
+
+    new_alerts:  list[dict] = []
+    pair_states: list[dict] = []  # populated each scan; replaces scan_pair_state() sweep
+
+    for symbol in PAIRS:
+        try:
+            await asyncio.sleep(0.2)  # rate-limit spacing ÃÂ¢ÃÂÃÂ 12 pairs ÃÂÃÂ 0.5s = 6s minimum spread
+            candles_1m, candles_5m, candles_15m, candles_1h, book, price = await _fetch_pair_data(bybit_client, symbol)
+
+            if not price or price == 0:
+                _stale_counts[symbol] = \
+                    _stale_counts.get(symbol, 0) + 1
+                if _stale_counts[symbol] >= 5:
+                    log.warning(f"[PRICE STALE] {symbol} - "
+                        f"{_stale_counts[symbol]} consecutive "
+                        f"scans with no price")
+                    _stale_prices.add(symbol)
+                else:
+                    log.warning(f"[PRICE STALE] {symbol} - "
+                        f"{_stale_counts[symbol]}/5 "
+                        f"consecutive no-price scans")
+                if (symbol in _stale_prices and
+                        _stale_counts.get(symbol, 0) > 8):
+                    log.error(
+                        f"[PRICE STALE CRITICAL] {symbol} - "
+                        f"{_stale_counts[symbol]} consecutive scan misses "
+                        f"with OPEN TRADE — exit monitor staleness "
+                        f"refetch (Change 3) should be compensating, "
+                        f"verify manually if this persists")
+                continue
+            _stale_counts[symbol] = 0
+            _stale_prices.discard(symbol)
+
+            # Pair cooldown pre-signal check — show stub card, don't vanish
+            _pair_cd_rem = get_pair_cooldown_remaining(symbol)
+            if _pair_cd_rem > 0:
+                pair_states.append({
+                    "symbol":              symbol,
+                    "price":               price,
+                    "pair_cooldown":       _pair_cd_rem,
+                    "j5m":                 50.0,
+                    "j15m":                50.0,
+                    "j1h":                 50.0,
+                    "rsi15m":              50.0,
+                    "adx1h":               0.0,
+                    "bid_pct":             0.0,
+                    "ask_pct":             0.0,
+                    "trend":               None,
+                    "short_qualifies":     False,
+                    "long_qualifies":      False,
+                    "session_blocked_short": False,
+                    "session_blocked_long":  False,
+                    "cooldown_short":      get_cooldown_remaining(symbol, "SHORT"),
+                    "cooldown_long":       get_cooldown_remaining(symbol, "LONG"),
+                })
+                continue
+
+            # ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ Indicators ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
+            _, _, j5m  = _compute_kdj(candles_1m[:-1])
+            _, _, j15m = _compute_kdj(candles_15m[:-1])
+            _, _, j1h  = _compute_kdj(candles_1h[:-1])
+            rsi15m     = _compute_rsi(candles_15m)
+            rsi1h      = _compute_rsi(candles_1h)
+            stoch_k, stoch_d           = _compute_stochastic(candles_15m)
+            stoch_k_prev, stoch_d_prev = _last_stoch.get(symbol, (50.0, 50.0))
+            _last_stoch[symbol]        = (stoch_k, stoch_d)
+            stoch_k_fast, stoch_d_fast           = _compute_stochastic(candles_15m, k_period=8)
+            stoch_k_prev_fast, stoch_d_prev_fast = _last_stoch_fast.get(symbol, (50.0, 50.0))
+            _last_stoch_fast[symbol]             = (stoch_k_fast, stoch_d_fast)
+            print(f"[STOCH FAST] {symbol} K={stoch_k_fast:.1f} D={stoch_d_fast:.1f} prev_K={stoch_k_prev_fast:.1f}")
+            atr5m      = _compute_atr(candles_5m)
+            atr15m     = _compute_atr(candles_15m)
+            atr1h      = _compute_atr(candles_1h)
+            adx1h      = _compute_adx(candles_1h)
+            ma10       = _compute_ma(candles_1h, 10)
+            ma30       = _compute_ma(candles_1h, 30)
+            ma60       = _compute_ma(candles_1h, 60)
+            trend      = _trend_from_ma(price, candles_5m, candles_15m, candles_1h, adx1h)
+            if symbol == "BTC":
+                global _btc_j1h
+                _btc_j1h = j1h
+                global _btc_j1h_history
+                _btc_j1h_history.append(_btc_j1h)
+                if len(_btc_j1h_history) > 12:
+                    _btc_j1h_history = \
+                        _btc_j1h_history[-12:]
+                # ── Dual-mode: compute regime from BTC 1m candle momentum ─────
+                global _regime, _regime_confidence, _btc_momentum_5c, _btc_candle_velocity, _regime_last_push
+                if candles_1m and len(candles_1m) >= 6:
+                    _closed_1m = candles_1m[-6:-1]  # last 5 fully closed 1m candles
+                    _btc_momentum_5c = sum(
+                        float(c["close"]) - float(c["open"]) for c in _closed_1m)
+                    _btc_candle_velocity = float(candles_1m[-1]["close"]) - float(candles_1m[-1]["open"])
+                _regime, _regime_confidence = _compute_regime(
+                    _btc_j1h, _btc_momentum_5c, _btc_candle_velocity)
+                print(f"[REGIME] BTC J1H={_btc_j1h:.1f}"
+                      f" mom5c={_btc_momentum_5c:.0f}"
+                      f" vel={_btc_candle_velocity:.1f}"
+                      f" => {_regime} ({_regime_confidence})")
+                # Push to Supabase venue_live_state (throttled to 30s)
+                _now_ts = time.time()
+                if _now_ts - _regime_last_push >= 30:
+                    _regime_last_push = _now_ts
+                    asyncio.create_task(_push_venue_live_state(
+                        "HL", _regime, _regime_confidence,
+                        _btc_j1h, _btc_momentum_5c, _btc_candle_velocity))
+            bid_pct, ask_pct = _depth_pcts(book)
+
+            vol_15m    = candles_15m[-1]["volume"] if candles_15m else 0
+            vol_ma15m  = (sum(c["volume"] for c in candles_15m[-10:]) / min(10, len(candles_15m))
+                          if candles_15m else 0)
+
+            # ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ SL distance (ATR base, floored by MIN_SL_PCT + session buffer) ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
+            # R8: dynamic ATR mult — ASIA wider spreads (x1.2), US tightest (x0.9), EU baseline
+            _atr_sess    = get_session_name()
+            _atr_mult    = (ATR_SL_MULTIPLIER * 1.2 if _atr_sess == "ASIA"
+                            else ATR_SL_MULTIPLIER * 0.9 if _atr_sess == "US"
+                            else ATR_SL_MULTIPLIER)
+            _sl_atr      = atr15m * _atr_mult
+            _min_sl_pct  = MIN_SL_PCT.get(symbol, MIN_SL_PCT_DEFAULT)
+            _sess_buf    = get_session_sl_buffer()
+            _min_sl_dist = price * (_min_sl_pct + _sess_buf)
+            sl_dist      = max(_sl_atr, _min_sl_dist)
+
+            # ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ BTC regime gate ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
+            _sym_base          = symbol.replace("_USDT", "").replace("USDT", "")
+            _pair_corr         = BTC_CORRELATION.get(_sym_base, 0.75)
+            _regime_block_short = False
+            _regime_block_long  = False
+            if _btc_j1h > 80.0:
+                _btc_regime_context = "LONG_BLOCKED"
+                if _pair_corr >= 0.70 and j1h >= J1H_LONG_MAX:  # bypass: pair already corrected past its own J1H gate
+                    _regime_block_long = True
+            elif _btc_j1h < 20.0:
+                _btc_regime_context = "SHORT_BLOCKED"
+                if _pair_corr >= 0.70 and j1h <= J1H_SHORT_MIN:  # bypass: pair already recovered above floor
+                    _regime_block_short = True
+            elif 40.0 <= _btc_j1h <= 60.0:
+                _btc_regime_context = "NEUTRAL_BLOCK"
+            else:
+                _btc_regime_context = "CLEAR"
+            _btc_regime_context = (_btc_regime_context or "UNKNOWN")
+            # ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ Component A2: BTC 1m flash crash detector ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
+            _flash_thresholds = {"ASIA": 0.0030, "EU": 0.0055, "US": 0.0050}
+            _cur_session  = get_session_name()
+            _flash_thresh = _flash_thresholds.get(_cur_session, 0.0050)
+            try:  # uses already-fetched candles_1m -- no extra API call
+                if candles_1m and len(candles_1m) >= 2:
+                    _lc = candles_1m[-2]
+                    _body_pct = abs(
+                        float(_lc["close"]) - float(_lc["open"])
+                    ) / float(_lc["open"])
+                    if (_body_pct >= _flash_thresh and
+                            float(_lc["close"]) < float(_lc["open"])):
+                        _btc_flash_block_until["long"] = (
+                            datetime.now(timezone.utc) + timedelta(minutes=5))
+                        _flash_closed.clear()
+                        _btc_flash_tg_pending[0] = True
+                        _regime_block_long = True
+                        _consec_adverse["long"] = 3  # BTC crash arms LONG halt immediately
+                        asyncio.create_task(_log_gate(
+                            "HL", symbol, "BTC_FLASH_BLOCK", "LONG",
+                            f"1m body={_body_pct*100:.2f}% "
+                            f">= {_flash_thresh*100:.2f}% "
+                            f"session={_cur_session} LONGs blocked 5min"))
+            except Exception as _fe:
+                log.warning(f"[BTC_FLASH] candle error: {_fe}")
+            # ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ Component B: Adverse cluster directional halt ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
+            if len(_adverse_cluster.get("long",  [])) >= 3: _regime_block_long  = True
+            if len(_adverse_cluster.get("short", [])) >= 3: _regime_block_short = True
+            # -- Graduated adverse cooldown check --------------------------------
+            _now_utc = datetime.now(timezone.utc)
+            if (_adverse_cooldown_until.get("long") and
+                    _now_utc < _adverse_cooldown_until["long"]):
+                _regime_block_long = True
+            if (_adverse_cooldown_until.get("short") and
+                    _now_utc < _adverse_cooldown_until["short"]):
+                _regime_block_short = True
+
+            if (_btc_flash_block_until.get("long") and
+                    _now_utc < _btc_flash_block_until["long"]):
+                _regime_block_long = True
+            # -- Consecutive kill halt: release if BTC CLEAR, block if >= 3 --
+            if _consec_adverse.get("long",  0) >= 3 and _btc_regime_context == "CLEAR":
+                _consec_adverse["long"]  = 0
+            if _consec_adverse.get("short", 0) >= 3 and _btc_regime_context == "CLEAR":
+                _consec_adverse["short"] = 0
+            if _consec_adverse.get("long",  0) >= 3:
+                _regime_block_long  = True
+            if _consec_adverse.get("short", 0) >= 3:
+                _regime_block_short = True
+            # Fleet directional toggles (manual dashboard override)
+            if _fleet_halt_long:
+                _regime_block_long  = True
+            if _fleet_halt_short:
+                _regime_block_short = True
+            # R4: local-venue convergence gate (CONVERGENCE_GATE_ENABLED in config)
+            # Blocks opposite direction when 55%+ of pairs have aligned breadth.
+            # _conv_gate_short/long are updated by main.py after each sentinel call.
+            if CONVERGENCE_GATE_ENABLED:
+                if _conv_gate_short:  # 55%+ pairs overbought -> block LONGs
+                    _regime_block_long  = True
+                if _conv_gate_long:   # 55%+ pairs oversold  -> block SHORTs
+                    _regime_block_short = True
+            # Dual-mode: block opposite direction in trending markets
+            if _regime == "BULL_TREND":
+                _regime_block_short = True  # no counter-trend SHORTs in bull
+            elif _regime == "BEAR_TREND":
+                _regime_block_long  = True  # no counter-trend LONGs in bear
+            # ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ Score both directions ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
+            # Accumulate pair state -- replaces scan_pair_state() second sweep
+            _s_raw = check_bounce_short(j15m, ask_pct, j5m)
+            _l_raw = check_bounce_long( j15m, bid_pct, j5m)
+            pair_states.append({
+                "symbol":       symbol,
+                "price":        price,
+                "j5m":          round(j5m,   2),
+                "j15m":         round(j15m,  2),
+                "j1h":          round(j1h,   2),
+                "rsi15m":       round(rsi15m, 2),
+                "adx1h":        round(adx1h, 2),
+                "bid_pct":      bid_pct,
+                "ask_pct":      ask_pct,
+                "trend":        trend,
+                "short_qualifies":  _s_raw,
+                "long_qualifies":   _l_raw,
+                "session_blocked_short": SESSION_FILTER_ENABLED and bool(BLOCKED_PAIR_SESSIONS.get((symbol, "SHORT", get_session_name()))),
+                "session_blocked_long":  SESSION_FILTER_ENABLED and bool(BLOCKED_PAIR_SESSIONS.get((symbol, "LONG",  get_session_name()))),
+                "cooldown_short": get_cooldown_remaining(symbol, "SHORT"),
+                "cooldown_long":  get_cooldown_remaining(symbol, "LONG"),
+            })
+            for direction in ("SHORT", "LONG"):
+                key = f"{symbol}{direction}"
+                _cur_sess = get_session_name()
+                # ── SESSION BLOCK (enforced) ───────────────────────────────────
+                # BLOCKED_PAIR_SESSIONS is defined in config.py.
+                # Without this check the dict is imported but NEVER EVALUATED:
+                # every entry in BLOCKED_PAIR_SESSIONS is dead code.
+                # SESSION_FILTER_ENABLED is the global on/off toggle.
+                if SESSION_FILTER_ENABLED and BLOCKED_PAIR_SESSIONS.get(
+                        (symbol, direction, _cur_sess)):
+                    asyncio.create_task(_log_gate(
+                        "HL", symbol, "SESSION_BLOCK", direction,
+                        f"({symbol},{direction},{_cur_sess}) in BLOCKED_PAIR_SESSIONS"))
+                    continue
+                _cd = get_cooldown_remaining(
+                    symbol, direction)
+                if _cd > 0:
+                    asyncio.create_task(
+                        _log_gate(
+                            "HL", symbol,
+                            "KILL_COOLDOWN",
+                            direction,
+                            f"post-KILL cooldown "
+                            f"{_cd}s remaining"))
+                    continue
+
+                # Skip scoring if trade already open — prevents BLOCKED_DUPLICATE noise
+                if key in _open_trades_ref:
+                    continue
+
+                # Dual-mode: is this a trend-continuation entry or a bounce entry?
+                _is_trend_entry = (
+                    (direction == "SHORT" and _regime == "BEAR_TREND") or
+                    (direction == "LONG"  and _regime == "BULL_TREND")
+                )
+                _trade_mode = "trend" if _is_trend_entry else "bounce"
+
+                if direction == "SHORT":
+                    if _regime_block_short:
+                        log.info(f"[REGIME] {symbol} SHORT blocked ÃÂ¢ÃÂÃÂ BTC J1H={_btc_j1h:.1f} corr={_pair_corr}")
+                        continue
+                    # BTC regime SHORT gate — correlation-gated (corr >= 0.70 only)
+                    # SHORT_BLOCKED bypass: if pair J1H > J1H_SHORT_MIN, pair already recovered
+                    if (direction == "SHORT" and
+                            _btc_regime_context == "SHORT_BLOCKED" and
+                            _pair_corr >= 0.70 and
+                            j1h <= J1H_SHORT_MIN):
+                        asyncio.create_task(_log_gate(
+                            "HL", symbol, "BTC_REGIME_CORR_BLOCK_S", direction,
+                            f"btc_j1h={_btc_j1h:.1f} SHORT_BLOCKED corr={_pair_corr:.2f}>=0.70 j1h={j1h:.1f}<={J1H_SHORT_MIN}"))
+                        continue
+                    # ── Bypass-specific gates (SHORT entering under BTC SHORT_BLOCKED) ──
+                    if (direction == "SHORT" and
+                            _btc_regime_context == "SHORT_BLOCKED" and
+                            _pair_corr >= 0.70 and
+                            j1h > J1H_SHORT_MIN):
+                        # Gate A: J15M must be deeply overbought during bypass
+                        if j15m <= BYPASS_J15M_SHORT_MIN:
+                            asyncio.create_task(_log_gate(
+                                "HL", symbol, "BYPASS_J15M_SHORT_FAIL", direction,
+                                f"bypass j15m={j15m:.1f} need>{BYPASS_J15M_SHORT_MIN:.0f} (BTC SHORT_BLOCKED)"))
+                            continue
+                        # Gate B: 30-min re-entry timer per pair after any bypass SHORT fires
+                        _bypass_cd_key = f"{symbol}SHORT"
+                        _bypass_cd_rem = int(_bypass_cooldowns.get(_bypass_cd_key, 0) - time.time())
+                        if _bypass_cd_rem > 0:
+                            asyncio.create_task(_log_gate(
+                                "HL", symbol, "BYPASS_REENTRY_CD_S", direction,
+                                f"bypass SHORT cooldown {_bypass_cd_rem}s remaining ({BYPASS_COOLDOWN_SECONDS//60}min timer)"))
+                            continue
+                    g_j15m  = j15m > (65.0 if _is_trend_entry else J15M_SHORT_GATE)
+                    g_j1h   = True if _is_trend_entry else (j1h > J1H_SHORT_MIN)
+                    g_stoch = True if _is_trend_entry else (stoch_k > 75 and stoch_k < stoch_d)
+                    g_depth = ask_pct >= DEPTH_GATE_PCT
+                    # BTC_MACRO_RISE removed — pair J15M/J1H gates are sufficient
+                    # SHORT session/J1H directional gates
+                    # Gate 1: SHORT_EU_J1H_HIGH
+                    # EU + J1H >= 78: 5 losses 1 win, -$1,062 net
+                    # High J1H in EU = trend has continuation room; exhaustion reversal fails
+                    if _cur_sess == "EU" and j1h >= 78:
+                        asyncio.create_task(_log_gate(
+                            "HL", symbol, "SHORT_EU_J1H_HIGH", direction,
+                            f"EU j1h={j1h:.1f} >= 78 — trend continuation not reversal"))
+                        continue
+                    # Gate 3b: J15M extreme overbought ceiling
+                    # Data: j15m>115 = 0% WR, squeeze risk -- extreme OB can extend
+                    if not _is_trend_entry and j15m > J15M_SHORT_CEILING:
+                        asyncio.create_task(_log_gate(
+                            "HL", symbol, "J15M_EXTREME_OB", direction,
+                            f"j15m={j15m:.1f} > J15M_SHORT_CEILING={J15M_SHORT_CEILING}"
+                            f" -- extreme overbought, squeeze can extend"))
+                        continue
+                    # MA-stack gate for SHORTs
+                    # Data: 3L_HIGHER_LOW 20 trades 0% WR -$744, all in BULL ma_stack
+                    # Block SHORTs when 1H trend structure is bullish aligned
+                    _ma_stack_now = (
+                        "BULL" if (ma10 and ma30 and ma60 and ma10 > ma30 > ma60) else
+                        "BEAR" if (ma10 and ma30 and ma60 and ma10 < ma30 < ma60)
+                        else "MIXED"
+                    )
+                    if not _is_trend_entry and _ma_stack_now == "BULL":
+                        asyncio.create_task(_log_gate(
+                            "HL", symbol, "MA_STACK_BULL_BLOCK", direction,
+                            f"ma10={ma10:.4f} ma30={ma30:.4f} ma60={ma60:.4f}"
+                            f" -- 1H uptrend, SHORT reversal invalid"))
+                        continue
+                    # J1H ceiling gate (enforced) — blocks SHORTs above valid bounce zone
+                    if j1h >= J1H_SHORT_MAX:
+                        asyncio.create_task(_log_gate(
+                            "HL", symbol, "J1H_RANGE_FAIL", direction,
+                            f"j1h={j1h:.1f} >= J1H_SHORT_MAX={J1H_SHORT_MAX}"))
+                        continue
+                    # RSI floor gate (enforced) — blocks SHORTs when 15m RSI approaching oversold
+                    if not _is_trend_entry and rsi15m <= RSI15M_SHORT_MIN:
+                        asyncio.create_task(_log_gate(
+                            "HL", symbol, "RSI_FLOOR_FAIL", direction,
+                            f"rsi15m={rsi15m:.1f} need>{RSI15M_SHORT_MIN}"))
+                        continue
+                    qualifies = (g_j15m and g_depth) if _is_trend_entry else check_bounce_short(j15m, ask_pct, j5m)
+                    _bid_from_ask = 100 - ask_pct
+                    _depth_ok_s   = (ask_pct >= DEPTH_SHORT_MIN)
+                    _j15m_s_need  = 65.0 if _is_trend_entry else J15M_SHORT_GATE
+                    _log_gates = (
+                        f"mode={_trade_mode}"
+                        f" j5m={j5m:.1f}(need>{J5M_SHORT_MIN:.0f})"
+                        f" j15m={j15m:.1f}(need>{_j15m_s_need:.0f})"
+                        f" j1h={j1h:.1f}"
+                        f" btc={_btc_j1h:.1f}"
+                        f" regime={_regime}"
+                        f" depth_ask={ask_pct:.1f}%"
+                        f"({'PASS' if _depth_ok_s else 'FAIL'},need>={DEPTH_SHORT_MIN:.0f})"
+                    )
+                else:
+                    if _regime_block_long:
+                        log.info(f"[REGIME] {symbol} LONG blocked ÃÂ¢ÃÂÃÂ BTC J1H={_btc_j1h:.1f} corr={_pair_corr}")
+                        continue
+                    g_j15m  = j15m < (35.0 if _is_trend_entry else J15M_LONG_GATE)
+                    g_j1h   = True if _is_trend_entry else (j1h >= J1H_LONG_MIN)
+                    g_stoch = True if _is_trend_entry else (stoch_k < 25 and stoch_k > stoch_d)
+                    g_depth = bid_pct >= DEPTH_GATE_PCT
+                    # BTC regime LONG gate — correlation-gated (corr >= 0.70 only)
+                    # Only LONG_BLOCKED (BTC J1H > 80) is a hard entry block.
+                    # NEUTRAL_BLOCK is informational only — not a hard gate.
+                    if (direction == "LONG" and
+                            _btc_regime_context == "LONG_BLOCKED" and
+                            _pair_corr >= 0.70 and
+                            j1h >= J1H_LONG_MAX):  # bypass: pair J1H < J1H_LONG_MAX means already corrected
+                        asyncio.create_task(_log_gate(
+                            "HL", symbol, "BTC_REGIME_CORR_BLOCK", direction,
+                            f"btc_j1h={_btc_j1h:.1f} LONG_BLOCKED corr={_pair_corr:.2f}>=0.70 j1h={j1h:.1f}>={J1H_LONG_MAX}"))
+                        continue
+                    # ── Bypass-specific gates (only when LONG enters under BTC LONG_BLOCKED) ──
+                    # These apply when the pair's J1H < J1H_LONG_MAX (pair corrected independently).
+                    if (direction == "LONG" and
+                            _btc_regime_context == "LONG_BLOCKED" and
+                            _pair_corr >= 0.70 and
+                            j1h < J1H_LONG_MAX):
+                        # Gate A: J15M must be deeply oversold during bypass
+                        if j15m >= BYPASS_J15M_MAX:
+                            asyncio.create_task(_log_gate(
+                                "HL", symbol, "BYPASS_J15M_FAIL", direction,
+                                f"bypass j15m={j15m:.1f} need<{BYPASS_J15M_MAX:.0f} (BTC LONG_BLOCKED)"))
+                            continue
+                        # Gate B: 30-min re-entry timer per pair after any bypass LONG fires
+                        _bypass_cd_key = f"{symbol}LONG"
+                        _bypass_cd_rem = int(_bypass_cooldowns.get(_bypass_cd_key, 0) - time.time())
+                        if _bypass_cd_rem > 0:
+                            asyncio.create_task(_log_gate(
+                                "HL", symbol, "BYPASS_REENTRY_CD", direction,
+                                f"bypass cooldown {_bypass_cd_rem}s remaining ({BYPASS_COOLDOWN_SECONDS//60}min timer)"))
+                            continue
+                    # J1H ceiling gate (enforced) — blocks LONGs above valid bounce zone
+                    if not _is_trend_entry and j1h >= J1H_LONG_MAX:
+                        asyncio.create_task(_log_gate(
+                            "HL", symbol, "J1H_CEILING_FAIL", direction,
+                            f"j1h={j1h:.1f} need j1h<{J1H_LONG_MAX}"))
+                        continue
+                    # MA-stack gate for LONGs
+                    # Symmetric to MA_STACK_BULL_BLOCK for SHORTs (data: 20 trades 0% WR -$744)
+                    # BEAR stack (ma10<ma30<ma60) = 1H confirmed downtrend -- LONG reversal fails
+                    _ma_stack_long = (
+                        "BULL" if (ma10 and ma30 and ma60 and ma10 > ma30 > ma60) else
+                        "BEAR" if (ma10 and ma30 and ma60 and ma10 < ma30 < ma60)
+                        else "MIXED"
+                    )
+                    if not _is_trend_entry and _ma_stack_long == "BEAR":
+                        asyncio.create_task(_log_gate(
+                            "HL", symbol, "MA_STACK_BEAR_BLOCK", direction,
+                            f"ma10={ma10:.4f} ma30={ma30:.4f} ma60={ma60:.4f}"
+                            f" -- 1H downtrend confirmed, LONG reversal invalid"))
+                        continue
+                    # BTC macro downtrend LONG gate — symmetric to SHORT uptrend gate
+                    # Block LONGs when BTC J1H is lower now than 10 scans ago (5 min)
+                    # Evidence: 7/12 02:06-02:14 cascade — 16 trades 0/16 WR -$759
+                    # Same criteria 45 min later (Batch B): 7/9 WR +$649
+                    if (len(_btc_j1h_history) >= 10
+                            and _btc_j1h < _btc_j1h_history[-10]):
+                        asyncio.create_task(_log_gate(
+                            "HL", symbol, "BTC_MACRO_FALL", direction,
+                            f"btc_j1h={_btc_j1h:.1f} < "
+                            f"{_btc_j1h_history[-10]:.1f} 10 scans ago"))
+                        continue
+                    # J15M freefall floor gate
+                    # Data: j15m < -10 = 22% WR -$278 (entries into free-fall)
+                    if not _is_trend_entry and j15m < J15M_LONG_FLOOR:
+                        asyncio.create_task(_log_gate(
+                            "HL", symbol, "J15M_FREEFALL", direction,
+                            f"j15m={j15m:.1f} < J15M_LONG_FLOOR={J15M_LONG_FLOOR}"
+                            f" -- freefall, no bounce context"))
+                        continue
+                    # LONG j5m freefall gate (all sessions)
+                    # Data: EU @107 j5m=-4.13 -$48.6; US SOL j5m=-19 -$32; US BTC j5m=-4.5 -$119
+                    # j5m < 0 = 5m price still descending, bounce has not started
+                    if j5m < 0:
+                        asyncio.create_task(_log_gate(
+                            "HL", symbol, "LONG_J5M_FREEFALL", direction,
+                            f"{_cur_sess} j5m={j5m:.1f} < 0 -- still descending at 5m, no bounce start"))
+                        continue
+                    # R5: EU LONG j15m tight gate
+                    # EU LONGs only valid when j15m < 15 (deep oversold)
+                    # Data: EU LONG j15m 15-30 = 25% WR -$112; EU LONG j15m < 15 = 71% WR +$389
+                    if not _is_trend_entry and _cur_sess == "EU" and j15m >= 15:
+                        asyncio.create_task(_log_gate(
+                            "HL", symbol, "EU_LONG_J15M_TIGHT", direction,
+                            f"EU j15m={j15m:.1f} >= 15 -- EU LONGs require j15m<15"))
+                        continue
+                    # RSI ceiling gate (enforced) — blocks LONGs when 15m RSI recovered above neutral
+                    # Data: ETH RSI=54.2, SUI RSI=53.9 tail losers Jul 19; all 9 winners had RSI<50
+                    if not _is_trend_entry and rsi15m >= RSI15M_LONG_MAX:
+                        asyncio.create_task(_log_gate(
+                            "HL", symbol, "RSI_CEILING_FAIL", direction,
+                            f"rsi15m={rsi15m:.1f} need<{RSI15M_LONG_MAX}"))
+                        continue
+                    qualifies = (g_j15m and g_depth) if _is_trend_entry else check_bounce_long(j15m, bid_pct, j5m)
+                    _depth_ok_l  = (bid_pct >= DEPTH_LONG_MIN)
+                    _j15m_l_need = 35.0 if _is_trend_entry else J15M_LONG_GATE
+                    _log_gates = (
+                        f"mode={_trade_mode}"
+                        f" j5m={j5m:.1f}(need<{J5M_LONG_MAX:.0f})"
+                        f" j15m={j15m:.1f}(need<{_j15m_l_need:.0f})"
+                        f" j1h={j1h:.1f}"
+                        f" btc={_btc_j1h:.1f}"
+                        f" regime={_regime}"
+                        f" depth_bid={bid_pct:.1f}%"
+                        f"({'PASS' if _depth_ok_l else 'FAIL'},need>={DEPTH_LONG_MIN:.0f})"
+                    )
+
+                # ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ GATE_FAIL log ÃÂ¢ÃÂÃÂ every scan when >= 3 of 4 gates pass ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
+                _gate_list  = [g_j15m, g_j1h, g_stoch, g_depth]
+                _gate_count = sum(_gate_list)
+                _blocked    = [n for n, v in zip(["J15M", "J1H", "STOCH", "DEPTH"], _gate_list) if not v]
+                if _gate_count >= 3:
+                    log.info(
+                        f"[GATE_FAIL] {symbol}"
+                        f" {direction}"
+                        f" j5m={j5m:.1f}"
+                        f" j15m={j15m:.1f}"
+                        f" bid={bid_pct:.1f}%"
+                        f" blocked="
+                        f"{_blocked}")
+
+                if not qualifies:
+                    _stoch_pass = (
+                        (direction == "SHORT" and j5m > 80 and j15m > J15M_SHORT_GATE) or
+                        (direction == "LONG"  and j5m < 10 and j15m < J15M_LONG_GATE)
+                    )
+                    if not _stoch_pass:
+                        asyncio.create_task(_log_gate("HL", symbol, "STOCH_GATE_FAIL", direction,
+                            f"j5m={j5m:.1f} j15m={j15m:.1f}"))
+                    else:
+                        asyncio.create_task(_log_gate("HL", symbol, "DEPTH_GATE_FAIL", direction,
+                            f"bid_pct={bid_pct:.1f} ask_pct={ask_pct:.1f}"))
+                    continue
+
+                if direction == "SHORT":
+                    sl_price  = round(price + sl_dist, 6)
+                    tp1_price = round(price - sl_dist * TP1_R, 6)
+                    tp2_price = round(price - sl_dist * TP2_R, 6)
+                else:
+                    sl_price  = round(price - sl_dist, 6)
+                    tp1_price = round(price + sl_dist * TP1_R, 6)
+                    tp2_price = round(price + sl_dist * TP2_R, 6)
+
+                dollar_risk = round(
+                    MARGIN_PER_TRADE * LEVERAGE * (sl_dist / price) if price else 0, 2
+                )
+
+                alert = {
+                    "symbol":       symbol,
+                    "btc_regime_context": _btc_regime_context,
+                    "regime":       _regime,
+                    "trade_mode":   _trade_mode,
+                    "direction":    direction,
+                    "leverage":     LEVERAGE,
+                    "entry_price":  price,
+                    "sl_price":     sl_price,
+                    "sl_dist":      round(sl_dist, 6),
+                    "tp1_price":    tp1_price,
+                    "tp2_price":    tp2_price,
+                    "dollar_risk":  dollar_risk,
+                    "j15m":         round(j15m, 2),
+                    "j1h":          round(j1h, 2),
+                    "j5m":          round(j5m, 2),
+                    "rsi15m":       round(rsi15m, 2),
+                    "stoch_k":      round(stoch_k, 2),
+                    "stoch_d":      round(stoch_d, 2),
+                    "stoch_k_entry": round(stoch_k_fast, 2),
+                    "stoch_d_entry": round(stoch_d_fast, 2),
+                    "rsi1h":        round(rsi1h, 2),
+                    "atr15m":       round(atr15m, 6),
+                    "adx1h":        round(adx1h, 2),
+                    "bid_pct":      bid_pct,
+                    "ask_pct":      ask_pct,
+                    "vol_15m":      vol_15m,
+                    "vol_ma15m":    vol_ma15m,
+                    "vol_surge":    (vol_15m > vol_ma15m * 1.5),
+                    "ma_stack_1h": (
+                        "BULL" if (ma10 and ma30 and ma60 and ma10 > ma30 > ma60)
+                        else "BEAR" if (ma10 and ma30 and ma60 and ma10 < ma30 < ma60)
+                        else "MIXED"),
+                    "trend":        trend,
+                    "ma10":         round(ma10, 6) if ma10 else None,
+                    "ma30":         round(ma30, 6) if ma30 else None,
+                    "ma60":         round(ma60, 6) if ma60 else None,
+                    "fired_at":     int(time.time()),
+                    "is_in_trade":   False,
+                    "margin":        MARGIN_PER_TRADE,
+                    "session":       get_session_name(),
+                    "btc_j1h":       round(_btc_j1h, 1),
+                }
+                _vwap_v, _vwap_pct, _vwap_pos = _compute_session_vwap(candles_15m, price)
+                if _vwap_v is not None:
+                    alert["vwap_at_entry"] = _vwap_v
+                    alert["vwap_pct_diff"] = _vwap_pct
+                    alert["vwap_position"] = _vwap_pos
+                # Co-fire limiter: cap same-direction signals per scan at 5
+                # Evidence: 7/12 02:06-02:14 — 12 LONG co-fires in 8 min, 0/12 WR -$759
+                _cofire_n = sum(1 for _ca in new_alerts if _ca["direction"] == direction)
+                if _cofire_n >= 3:   # tighter: data shows 3+ co-fires = 0% WR -$759
+                    log.info(
+                        f"[COFIRE_LIMIT] {symbol} {direction} "
+                        f"skipped — {_cofire_n} {direction} signals "
+                        f"already queued this scan")
+                    continue
+                # Stamp bypass re-entry cooldown when a bypass LONG signal fires
+                if (direction == "LONG" and
+                        _btc_regime_context == "LONG_BLOCKED" and
+                        _pair_corr >= 0.70 and
+                        j1h < J1H_LONG_MAX):
+                    _bypass_cooldowns[f"{symbol}LONG"] = time.time() + BYPASS_COOLDOWN_SECONDS
+                    alert["bypass_entry"] = True
+                # Stamp bypass re-entry cooldown when a bypass SHORT signal fires
+                if (direction == "SHORT" and
+                        _btc_regime_context == "SHORT_BLOCKED" and
+                        _pair_corr >= 0.70 and
+                        j1h > J1H_SHORT_MIN):
+                    _bypass_cooldowns[f"{symbol}SHORT"] = time.time() + BYPASS_COOLDOWN_SECONDS
+                    alert["bypass_entry"] = True
+                new_alerts.append(alert)
+                log.info(
+                    f"[SIGNAL] {symbol} {direction}"
+                    f" lev={LEVERAGE}x"
+                    f" entry={price:.5f}"
+                    f" sl={sl_price:.5f}"
+                    f" tp1={tp1_price:.5f}"
+                    f" j5m={j5m:.1f}"
+                    f" j15m={j15m:.1f}"
+                    f" j1h={j1h:.1f}"
+                    f" btc={_btc_j1h:.1f}"
+                    f"({_btc_regime_context})"
+                    f" depth={bid_pct:.1f}%B/{ask_pct:.1f}%A"
+                    f" adx={adx1h:.1f}"
+                    f" sess={_cur_sess}"
+                )
+
+        except Exception as e:
+            log.error(f"[SCAN] {symbol} error: {e}", exc_info=True)
+
+    log.info(f"[SCAN] #{_scan_count} complete -- {len(new_alerts)} signals, {len(pair_states)} pair states")
+    return new_alerts, pair_states
+
+
+async def scan_pair_state(bybit_client) -> list[dict]:
+    """Return lightweight per-pair indicator state for the dashboard grid."""
+    states = []
+    for symbol in PAIRS:
+        try:
+            await asyncio.sleep(0.2)  # rate-limit spacing between pairs
+            candles_1m, candles_5m, candles_15m, candles_1h, book, price = await _fetch_pair_data(bybit_client, symbol)
+            if not price:
+                states.append({"symbol": symbol, "price": 0})
+                continue
+
+            _, _, j5m  = _compute_kdj(candles_1m[:-1])
+            _, _, j15m = _compute_kdj(candles_15m[:-1])
+            _, _, j1h  = _compute_kdj(candles_1h[:-1])
+            rsi15m     = _compute_rsi(candles_15m)
+            rsi1h      = _compute_rsi(candles_1h)
+            stoch_k, stoch_d           = _compute_stochastic(candles_15m)
+            stoch_k_prev, stoch_d_prev = _last_stoch.get(symbol, (50.0, 50.0))
+            _last_stoch[symbol]        = (stoch_k, stoch_d)
+            stoch_k_fast, stoch_d_fast           = _compute_stochastic(candles_15m, k_period=8)
+            stoch_k_prev_fast, stoch_d_prev_fast = _last_stoch_fast.get(symbol, (50.0, 50.0))
+            _last_stoch_fast[symbol]             = (stoch_k_fast, stoch_d_fast)
+            print(f"[STOCH FAST] {symbol} K={stoch_k_fast:.1f} D={stoch_d_fast:.1f} prev_K={stoch_k_prev_fast:.1f}")
+            atr15m     = _compute_atr(candles_15m)
+            adx1h      = _compute_adx(candles_1h)
+            ma10       = _compute_ma(candles_1h, 10)
+            ma30       = _compute_ma(candles_1h, 30)
+            ma60       = _compute_ma(candles_1h, 60)
+            trend      = _trend_from_ma(price, candles_5m, candles_15m, candles_1h, adx1h)
+            bid_pct, ask_pct = _depth_pcts(book)
+
+            short_qualifies = check_bounce_short(j15m, ask_pct, j5m)
+            long_qualifies  = check_bounce_long( j15m, bid_pct, j5m)
+
+            states.append({
+                "symbol":      symbol,
+                "price":       price,
+                "j5m":         round(j5m, 2),
+                "j15m":        round(j15m, 2),
+                "j1h":         round(j1h, 2),
+                "rsi15m":      round(rsi15m, 2),
+                "stoch_k":     round(stoch_k, 2),
+                "stoch_d":     round(stoch_d, 2),
+                "stoch_k_prev": round(stoch_k_prev, 2),
+                "stoch_d_prev": round(stoch_d_prev, 2),
+                "stoch_k_fast":      round(stoch_k_fast, 2),
+                "stoch_d_fast":      round(stoch_d_fast, 2),
+                "stoch_k_prev_fast": round(stoch_k_prev_fast, 2),
+                "stoch_d_prev_fast": round(stoch_d_prev_fast, 2),
+                "rsi1h":       round(rsi1h, 2),
+                "atr15m":      round(atr15m, 6),
+                "adx1h":       round(adx1h, 2),
+                "bid_pct":     bid_pct,
+                "ask_pct":     ask_pct,
+                "bid_wall":    _find_book_wall(book.get("bids", []), price, True),
+                "ask_wall":    _find_book_wall(book.get("asks", []), price, False),
+                "trend":       trend,
+                "ma10":        round(ma10, 6) if ma10 else None,
+                "ma30":        round(ma30, 6) if ma30 else None,
+                "ma60":        round(ma60, 6) if ma60 else None,
+                "short_qualifies": short_qualifies,
+                "long_qualifies":  long_qualifies,
+                "cooldown_short": get_cooldown_remaining(symbol, "SHORT"),
+                "cooldown_long":  get_cooldown_remaining(symbol, "LONG"),
+            })
+        except Exception as e:
+            log.error(f"[STATE] {symbol} error: {e}")
+            states.append({"symbol": symbol, "price": 0})
+    return states
+
+
+
+def _compute_session_vwap(candles_15m: list, entry_price: float):
+    """Session VWAP from midnight ET. Returns (None, None, None) on any failure."""
+    try:
+        from zoneinfo import ZoneInfo as _ZI
+        from datetime import datetime as _DT, timezone as _TZ
+        _et     = _ZI("America/New_York")
+        _now_et = _DT.now(_et)
+        _mid_et = _now_et.replace(hour=0, minute=0, second=0, microsecond=0)
+        _mid_s  = _mid_et.astimezone(_TZ.utc).timestamp()
+        if not candles_15m:
+            return None, None, None
+        _ts_key = "time" if "time" in candles_15m[0] else "timestamp"
+        _is_ms  = candles_15m[0].get(_ts_key, 0) > 1_000_000_000_000
+        _thresh = _mid_s * 1000 if _is_ms else _mid_s
+        _sess   = [c for c in candles_15m if c.get(_ts_key, 0) >= _thresh]
+        if not _sess:
+            return None, None, None
+        _tpv = sum(((c["high"] + c["low"] + c["close"]) / 3.0) * c["volume"] for c in _sess)
+        _vol = sum(c["volume"] for c in _sess)
+        if _vol == 0:
+            return None, None, None
+        _vwap = _tpv / _vol
+        _pct  = (entry_price - _vwap) / _vwap * 100
+        _pos  = "ABOVE" if _pct > 0.1 else "BELOW" if _pct < -0.1 else "AT"
+        return round(_vwap, 6), round(_pct, 3), _pos
+    except Exception:
+        return None, None, None
+
+
+async def _fetch_pair_data(bybit_client, symbol: str):
+    """Fetch pair data; 15m/1h/5m candles served from cache when fresh."""
+    c5m  = _cache_get(symbol, "5m")
+    c15m = _cache_get(symbol, "15m")
+    c1h  = _cache_get(symbol, "1h")
+    tasks = [bybit_client.get_candles(symbol, "1m", 30)]
+    need_5m  = c5m  is None
+    need_15m = c15m is None
+    need_1h  = c1h  is None
+    if need_5m:  tasks.append(bybit_client.get_candles(symbol, "5m",  100))
+    if need_15m: tasks.append(bybit_client.get_candles(symbol, "15m", 100))
+    if need_1h:  tasks.append(bybit_client.get_candles(symbol, "1h",  100))
+    tasks.extend([bybit_client.get_orderbook(symbol, 20), bybit_client.get_price(symbol)])
+    results = await asyncio.gather(*tasks)
+    idx = 0
+    candles_1m = results[idx]; idx += 1
+    if need_5m:  c5m  = results[idx]; idx += 1; _cache_set(symbol, "5m",  c5m,  180)
+    if need_15m: c15m = results[idx]; idx += 1; _cache_set(symbol, "15m", c15m, 360)
+    if need_1h:  c1h  = results[idx]; idx += 1; _cache_set(symbol, "1h",  c1h,  900)
+    book  = results[idx]; idx += 1
+    price = results[idx]
+    return candles_1m, c5m, c15m, c1h, book, price
+
+
+def log_startup_config():
+    log.info(
+        f"[CONFIG] PAIRS={len(PAIRS)} "
+        f"J15M_SHORT={J15M_SHORT_GATE} J15M_LONG={J15M_LONG_GATE} "
+        f"J1H_SHORT_MIN={J1H_SHORT_MIN} J1H_LONG_MIN={J1H_LONG_MIN} "
+        f"RSI_SHORT={RSI15M_SHORT_MIN} RSI_LONG={RSI15M_LONG_MAX} "
+        f"DEPTH={DEPTH_GATE_PCT}% ATR_SL={ATR_SL_MULTIPLIER}x "
+        f"ADX_MIN_LONG={ADX_MIN_LONG} ADX_MIN_SHORT={ADX_MIN_SHORT} "
+        f"CIRCUIT_BREAKER={CONSECUTIVE_LOSS_STOP} PAPER={PAPER_MODE}"
+    )
+
+
+def set_pair_cooldown(
+        symbol: str,
+        duration: int =
+        PAIR_COOLDOWN_SECONDS
+) -> None:
+    _pair_cooldowns[symbol] = (
+        time.time() + duration)
+    print(
+        f"[PAIR COOLDOWN] {symbol}"
+        f" cooling down for"
+        f" {duration}s")
+
+
+def get_pair_cooldown_remaining(
+        symbol: str
+) -> float:
+    exp = _pair_cooldowns.get(
+        symbol, 0)
+    remaining = exp - time.time()
+    if remaining <= 0:
+        _pair_cooldowns.pop(
+            symbol, None)
+        return 0.0
+    return round(remaining, 1)
+
+
+def get_all_cooldowns() -> dict:
+    now = time.time()
+    result = {}
+    expired = []
+    for sym, exp in list(
+            _pair_cooldowns.items()):
+        rem = exp - now
+        if rem > 0:
+            result[sym] = round(rem, 1)
+        else:
+            expired.append(sym)
+    for sym in expired:
+        _pair_cooldowns.pop(sym, None)
+    return result
+
