@@ -1,4 +1,4 @@
-/*  Bounce Scanner II  dashboard.js  */
+/*  OKX Futures Scanner  dashboard.js  */
 let STATE        = null;
 let activeFilter = 'ALL';
 let activeTab    = 'grid';
@@ -92,7 +92,7 @@ function setNav(el) {
   if (STATE) render();
 }
 
-//  HyperLiquid Account Pill & Overlay 
+//  OKX Account Pill & Overlay 
 let _hlAccFetched = false;
 let _hlAccMasked  = true;
 let _hlAccData    = null;
@@ -1211,7 +1211,7 @@ function buildPosCard(t, prices, pairStates) {
       <span style="color:#ffaa00;font-size:13px;line-height:1"></span>
       <span class="pcv2-sig">Bounce</span>
       <span style="font-size:11px;font-weight:700;color:${dirCol}">${cond}</span>
-      ${score >= 4 ? `<span class="pcv2-sc" title="${score}pts" style="letter-spacing:2px;font-size:14px;color:${score>=10?'#f59e0b':score>=8?'#22c55e':score>=6?'#a855f7':'#94a3b8'}">${'●'.repeat(Math.min(Math.floor((score-2)/2),4))}${'○'.repeat(4-Math.min(Math.floor((score-2)/2),4))}</span>` : ''}
+      ${score >= 4 ? `<span class="pcv2-sc" title="${score}pts" style="letter-spacing:2px;font-size:14px;color:${score>=10?'#f59e0b':score>=8?'#22c55e':score>=6?'#06b6d4':'#94a3b8'}">${'●'.repeat(Math.min(Math.floor((score-2)/2),4))}${'○'.repeat(4-Math.min(Math.floor((score-2)/2),4))}</span>` : ''}
     </div>
     <span class="pcv2-timer" id="${tid}">00:00:00</span>
   </div>
@@ -1830,7 +1830,7 @@ async function exportCsv() {
   const blob = new Blob([csvRows.join('\n')], { type: 'text/csv' });
   const a    = document.createElement('a');
   a.href     = URL.createObjectURL(blob);
-  a.download = `trade_log_${fromStr||'all'}_to_${toStr||'all'}.csv`;
+  a.download = `okx_trade_log_${fromStr||'all'}_to_${toStr||'all'}.csv`;
   a.click();
   URL.revokeObjectURL(a.href);
 }
@@ -2663,7 +2663,7 @@ async function _ovCloseTrade(sym, dir) {
     const symEl = document.getElementById('lt-ov-sym');
     if (symEl) symEl.textContent = sym;
     const subEl = document.getElementById('lt-ov-sub');
-    if (subEl) subEl.textContent = dir + ' · Hyperliquid · Loading…';
+    if (subEl) subEl.textContent = dir + ' · OKX · Loading…';
     document.getElementById('lt-ov-left').innerHTML  = '<div style="font-family:JetBrains Mono,monospace;font-size:11px;color:#fff;text-align:center;padding:40px 0">Loading brief…</div>';
     document.getElementById('lt-ov-right').innerHTML = '';
     document.getElementById('lt-ov-confirm').innerHTML = '<div style="font-family:JetBrains Mono,monospace;font-size:11px;color:#555;padding:12px 0">Loading…</div>';
@@ -2705,7 +2705,7 @@ async function _ovCloseTrade(sym, dir) {
     // Header tags
     const tagsEl = document.getElementById('lt-ov-tags');
     if (tagsEl) tagsEl.innerHTML =
-      '<span style="background:rgba(168,85,247,0.15);border:1px solid rgba(168,85,247,0.4);border-radius:4px;padding:2px 7px;font-family:JetBrains Mono,monospace;font-size:9px;font-weight:700;color:#a855f7">HL</span> ' +
+      '<span style="background:rgba(168,85,247,0.15);border:1px solid rgba(168,85,247,0.4);border-radius:4px;padding:2px 7px;font-family:JetBrains Mono,monospace;font-size:9px;font-weight:700;color:#06b6d4">HL</span> ' +
       '<span style="background:rgba(' + (isLong ? '34,197,94' : '248,113,113') + ',0.12);border:1px solid rgba(' + (isLong ? '34,197,94' : '248,113,113') + ',0.35);border-radius:4px;padding:2px 7px;font-family:JetBrains Mono,monospace;font-size:9px;font-weight:700;color:' + dirCol + '">' + dir + '</span>' +
       (ad.score ? ' <span style="background:rgba(255,255,255,0.06);border:1px solid #222;border-radius:4px;padding:2px 7px;font-family:JetBrains Mono,monospace;font-size:9px;font-weight:700;color:#fff">' + ad.score + 'pts</span>' : '') +
       (ad.tier  ? ' <span style="background:rgba(255,170,0,0.1);border:1px solid rgba(255,170,0,0.3);border-radius:4px;padding:2px 7px;font-family:JetBrains Mono,monospace;font-size:9px;font-weight:700;color:#ffaa00">T' + ad.tier + '</span>' : '');
@@ -2806,7 +2806,7 @@ async function _ovCloseTrade(sym, dir) {
     const useType = margin >= 1000;
     if (useType) {
       const expected = sym + ' ' + dir;
-      confEl.innerHTML = '<div style="font-family:JetBrains Mono,monospace;font-size:9px;font-weight:700;color:#fff;margin-bottom:6px">Type <span style=color:#a855f7>' + expected + '</span> to confirm</div>' +
+      confEl.innerHTML = '<div style="font-family:JetBrains Mono,monospace;font-size:9px;font-weight:700;color:#fff;margin-bottom:6px">Type <span style=color:#06b6d4>' + expected + '</span> to confirm</div>' +
         '<input class="lt-confirm-input" id="lt-confirm-input" placeholder="' + expected + '" autocomplete="off" oninput="_ltOnTypeInput(this,\'' + expected + '\')">' +
         '<button class="lt-arm-btn idle" id="lt-submit-btn" disabled onclick="_ltSubmit(\'' + sym + '\',\'' + dir + '\')">SUBMIT LIVE ORDER</button>';
     } else {
@@ -2867,7 +2867,7 @@ async function _ovCloseTrade(sym, dir) {
       grid.innerHTML = '<div style="text-align:center;padding:60px 20px">' +
         '<div style="font-size:28px;margin-bottom:12px">&#128994;</div>' +
         '<div style="font-family:JetBrains Mono,monospace;font-size:13px;font-weight:700;color:#fff;margin-bottom:8px">No live positions open</div>' +
-        '<div style="font-family:JetBrains Mono,monospace;font-size:10px;font-weight:600;color:#fff">Tap OPEN LIVE on any active alert card to place a real order on Hyperliquid.</div>' +
+        '<div style="font-family:JetBrains Mono,monospace;font-size:10px;font-weight:600;color:#fff">Tap OPEN LIVE on any active alert card to place a real order on OKX.</div>' +
         '</div>';
       return;
     }
@@ -2877,7 +2877,7 @@ async function _ovCloseTrade(sym, dir) {
 
   function buildLivePosCard(t, prices, pairStates) {
     const sym = t.symbol, isLong = t.direction === 'LONG';
-    const exch = t.exchange || 'HL', exchCol = exch === 'MEXC' ? '#ff8c00' : '#a855f7';
+    const exch = t.exchange || 'HL', exchCol = exch === 'MEXC' ? '#ff8c00' : '#06b6d4';
     const current = t.current_price || prices[sym] || t.entry_price || 0;
     const entry = t.entry_price || 0, sl = t.sl_price || 0, tp1 = t.tp1_price || 0, tp2 = t.tp2_price || 0;
     const trailBest = t.trail_best_price || 0, trailStop = t.trail_stop_price || 0;
@@ -2913,7 +2913,7 @@ async function _ovCloseTrade(sym, dir) {
       '<span class="pcv2-dir" style="color:'+dirCol+';border-color:'+dirCol+'">'+t.direction+'</span>' +
       '<span style="background:rgba(168,85,247,0.12);border:1px solid rgba(168,85,247,0.35);border-radius:4px;padding:1px 5px;font-family:JetBrains Mono,monospace;font-size:9px;font-weight:700;color:'+exchCol+'">'+exch+'</span>' +
       '<span class="lpc-live-badge"><span class="lpc-live-dot"></span>LIVE</span>' +
-      (score>=4?'<span class="pcv2-sc" title="'+score+'pts" style="letter-spacing:2px;font-size:14px;color:'+(score>=10?'#f59e0b':score>=8?'#22c55e':score>=6?'#a855f7':'#94a3b8')+'">'+'●'.repeat(Math.min(Math.floor((score-2)/2),4))+'○'.repeat(4-Math.min(Math.floor((score-2)/2),4))+'</span>':'')+
+      (score>=4?'<span class="pcv2-sc" title="'+score+'pts" style="letter-spacing:2px;font-size:14px;color:'+(score>=10?'#f59e0b':score>=8?'#22c55e':score>=6?'#06b6d4':'#94a3b8')+'">'+'●'.repeat(Math.min(Math.floor((score-2)/2),4))+'○'.repeat(4-Math.min(Math.floor((score-2)/2),4))+'</span>':'')+
       '</div><span class="pcv2-timer" id="'+tid+'">00:00:00</span></div>' +
       '<div class="pcv2-sub" style="padding:0 14px 8px">'+lev+'x  '+marginFmt+'  '+openFmt+(t.session?'  <span style="color:#aaa;font-size:10px;letter-spacing:1px">'+t.session+'</span>':'')+'</div>' +
       '<div class="pcv2-live" style="padding:0 14px 8px"><span class="pcv2-price">'+fmtPrice(current)+'</span><span style="font-family:JetBrains Mono,monospace;font-size:12px;font-weight:700;color:'+dltCol+'">'+dltStr+'</span><span class="pcv2-pnl" style="color:'+pnlCol+';margin-left:auto">'+(pnl>=0?'+':'')+'$'+pnl.toFixed(2)+'</span><span class="pcv2-r" style="color:'+rCol+'">'+(r>=0?'+':'')+''+r.toFixed(2)+'R</span></div>' +
@@ -3316,10 +3316,10 @@ async function _cfgDoReset(btn) {
           '<div style="display:flex;gap:8px;width:100%;align-items:center">' +
             '<input id="cfg-bot-name-inp" type="text" value="' + _cfgEsc(name) + '" ' +
               'style="flex:1;background:#0d0d0d;border:1px solid #2a2a2a;border-radius:6px;' +
-              'padding:8px 10px;font-family:JetBrains Mono,monospace;font-size:17px;color:#a855f7;outline:none" ' +
+              'padding:8px 10px;font-family:JetBrains Mono,monospace;font-size:17px;color:#06b6d4;outline:none" ' +
               'placeholder="e.g. hl-main">' +
             '<button onclick="cfgSetBotName()" ' +
-              'style="padding:8px 12px;background:#a855f7;border:none;border-radius:6px;' +
+              'style="padding:8px 12px;background:#06b6d4;border:none;border-radius:6px;' +
               'font-family:JetBrains Mono,monospace;font-size:14px;font-weight:800;color:#000;' +
               'cursor:pointer;white-space:nowrap;letter-spacing:0.08em">' +
               'SET BOT NAME</button>' +
@@ -3333,19 +3333,19 @@ async function _cfgDoReset(btn) {
         '<div class="hl-cfg-manifest-row" style="border-bottom:none;flex-direction:column;align-items:flex-start;gap:10px">' +
           '<div style="display:flex;justify-content:space-between;align-items:center;width:100%">' +
             '<span class="hl-cfg-manifest-lbl" style="color:#fff;font-weight:700">INSTANCE NAME</span>' +
-            '<span style="font-family:Bebas Neue,sans-serif;font-size:30px;color:#a855f7">' + _cfgEsc(name) + '</span>' +
+            '<span style="font-family:Bebas Neue,sans-serif;font-size:30px;color:#06b6d4">' + _cfgEsc(name) + '</span>' +
           '</div>' +
           '<button id="cfg-bot-change-btn" onclick="cfgIdentityArm()" ' +
-            'style="width:100%;padding:10px;background:transparent;border:1px solid #a855f7;border-radius:6px;' +
-            'font-family:JetBrains Mono,monospace;font-size:15px;font-weight:700;color:#a855f7;' +
+            'style="width:100%;padding:10px;background:transparent;border:1px solid #06b6d4;border-radius:6px;' +
+            'font-family:JetBrains Mono,monospace;font-size:15px;font-weight:700;color:#06b6d4;' +
             'cursor:pointer;letter-spacing:0.08em;transition:all 0.2s">' +
             'CHANGE BOT NAME</button>' +
           '<div id="cfg-bot-change-form" style="display:none;flex-direction:column;gap:8px;width:100%">' +
             '<input id="cfg-bot-name-inp" type="text" value="' + _cfgEsc(name) + '" ' +
               'style="width:100%;box-sizing:border-box;background:#0d0d0d;border:1px solid #2a2a2a;border-radius:6px;' +
-              'padding:8px 10px;font-family:JetBrains Mono,monospace;font-size:17px;color:#a855f7;outline:none">' +
+              'padding:8px 10px;font-family:JetBrains Mono,monospace;font-size:17px;color:#06b6d4;outline:none">' +
             '<button onclick="cfgSetBotName()" ' +
-              'style="width:100%;padding:10px;background:#a855f7;border:none;border-radius:6px;' +
+              'style="width:100%;padding:10px;background:#06b6d4;border:none;border-radius:6px;' +
               'font-family:JetBrains Mono,monospace;font-size:15px;font-weight:800;color:#000;' +
               'cursor:pointer;letter-spacing:0.08em">SAVE</button>' +
           '</div>' +
@@ -3364,13 +3364,13 @@ async function _cfgDoReset(btn) {
     if (!btn) return;
     if (!_cfgIdentityArmed) {
       _cfgIdentityArmed = true;
-      btn.style.background = '#a855f7';
+      btn.style.background = '#06b6d4';
       btn.style.color = '#000';
       btn.textContent = 'TAP TO CONFIRM';
       _cfgIdentityTimer = setTimeout(function() {
         _cfgIdentityArmed = false;
         btn.style.background = 'transparent';
-        btn.style.color = '#a855f7';
+        btn.style.color = '#06b6d4';
         btn.textContent = 'CHANGE BOT NAME';
       }, 3000);
     } else {
