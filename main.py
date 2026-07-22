@@ -2374,7 +2374,7 @@ async def _exit_monitor_loop():
                         and _sh.get("be_armed")
                         and _elapsed >= 16
                         and _dr_ac > 0
-                        and _sh.get("peak_pnl_r", 0) >= 0.15
+                        and _sh.get("peak_pnl_r", 0) >= 0.10
                         and _sh.get("peak_pnl_usd", 0.0) >= _sentinel_min
                         and (_cpnl / _dr_ac) < _sh.get("peak_pnl_r", 0) * _pp_decay_th):
                     _pp_r = _cpnl / _dr_ac
