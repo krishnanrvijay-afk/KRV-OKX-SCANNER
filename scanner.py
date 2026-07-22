@@ -463,7 +463,7 @@ def compute_market_health(pair_states: list[dict], recent_trades: list[dict]) ->
 
 # ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ Main scan ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
 
-async def run_full_scan(bybit_client, market_health: Optional[dict] = None, open_trades: dict = None) -> list[dict]:
+async def run_full_scan(okx_client, market_health: Optional[dict] = None, open_trades: dict = None) -> list[dict]:
     global _scan_count
     global _fleet_halt
     _open_trades_ref = open_trades if open_trades is not None else {}
@@ -532,7 +532,7 @@ async def run_full_scan(bybit_client, market_health: Optional[dict] = None, open
     for symbol in PAIRS:
         try:
             await asyncio.sleep(0.2)  # rate-limit spacing ÃÂ¢ÃÂÃÂ 12 pairs ÃÂÃÂ 0.5s = 6s minimum spread
-            candles_1m, candles_5m, candles_15m, candles_1h, book, price = await _fetch_pair_data(bybit_client, symbol)
+            candles_1m, candles_5m, candles_15m, candles_1h, book, price = await _fetch_pair_data(okx_client, symbol)
 
             if not price or price == 0:
                 _stale_counts[symbol] = \
@@ -1138,13 +1138,13 @@ async def run_full_scan(bybit_client, market_health: Optional[dict] = None, open
     return new_alerts, pair_states
 
 
-async def scan_pair_state(bybit_client) -> list[dict]:
+async def scan_pair_state(okx_client) -> list[dict]:
     """Return lightweight per-pair indicator state for the dashboard grid."""
     states = []
     for symbol in PAIRS:
         try:
             await asyncio.sleep(0.2)  # rate-limit spacing between pairs
-            candles_1m, candles_5m, candles_15m, candles_1h, book, price = await _fetch_pair_data(bybit_client, symbol)
+            candles_1m, candles_5m, candles_15m, candles_1h, book, price = await _fetch_pair_data(okx_client, symbol)
             if not price:
                 states.append({"symbol": symbol, "price": 0})
                 continue
@@ -1239,19 +1239,19 @@ def _compute_session_vwap(candles_15m: list, entry_price: float):
         return None, None, None
 
 
-async def _fetch_pair_data(bybit_client, symbol: str):
+async def _fetch_pair_data(okx_client, symbol: str):
     """Fetch pair data; 15m/1h/5m candles served from cache when fresh."""
     c5m  = _cache_get(symbol, "5m")
     c15m = _cache_get(symbol, "15m")
     c1h  = _cache_get(symbol, "1h")
-    tasks = [bybit_client.get_candles(symbol, "1m", 30)]
+    tasks = [okx_client.get_candles(symbol, "1m", 30)]
     need_5m  = c5m  is None
     need_15m = c15m is None
     need_1h  = c1h  is None
-    if need_5m:  tasks.append(bybit_client.get_candles(symbol, "5m",  100))
-    if need_15m: tasks.append(bybit_client.get_candles(symbol, "15m", 100))
-    if need_1h:  tasks.append(bybit_client.get_candles(symbol, "1h",  100))
-    tasks.extend([bybit_client.get_orderbook(symbol, 20), bybit_client.get_price(symbol)])
+    if need_5m:  tasks.append(okx_client.get_candles(symbol, "5m",  100))
+    if need_15m: tasks.append(okx_client.get_candles(symbol, "15m", 100))
+    if need_1h:  tasks.append(okx_client.get_candles(symbol, "1h",  100))
+    tasks.extend([okx_client.get_orderbook(symbol, 20), okx_client.get_price(symbol)])
     results = await asyncio.gather(*tasks)
     idx = 0
     candles_1m = results[idx]; idx += 1
