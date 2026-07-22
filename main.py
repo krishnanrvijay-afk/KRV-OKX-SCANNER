@@ -41,7 +41,7 @@ from config import (
 )
 from supabase import create_client, Client
 import sentinel as _sentinel_mod
-from okx_client import OkxClient
+from bybit_client import OkxClient
 from scanner import (
     run_full_scan, scan_pair_state,
     get_scan_count, set_close_cooldown, clear_cooldown,
