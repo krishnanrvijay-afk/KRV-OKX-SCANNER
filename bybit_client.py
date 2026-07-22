@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import hashlib
 import hmac
 import json
@@ -8,62 +9,70 @@ from typing import Optional
 import os
 import httpx
 
-log = logging.getLogger("bybit_client")
+log = logging.getLogger("okx_client")
 
-BYBIT_BASE = "https://api.bybit.com"
+OKX_BASE = "https://www.okx.com"
 
-_TF_MAP = {"1m": "1", "5m": "5", "15m": "15", "1h": "60", "4h": "240", "1d": "D"}
+_TF_MAP = {"1m": "1m", "5m": "5m", "15m": "15m", "1h": "1H", "4h": "4H", "1d": "1D"}
 
 def _sym(symbol: str) -> str:
-    """Internal symbol (BTC) -> Bybit format (BTCUSDT)."""
-    return symbol if symbol.endswith("USDT") else symbol + "USDT"
+    """Internal symbol (BTC) -> OKX format (BTC-USDT-SWAP)."""
+    if "-" in symbol:
+        return symbol
+    return f"{symbol}-USDT-SWAP"
 
 def _tf(interval: str) -> str:
     return _TF_MAP.get(interval, interval)
 
 
-class BybitClient:
+class OkxClient:
     def __init__(self):
-        self.api_key    = os.environ.get("BYBIT_API_KEY", "")
-        self.api_secret = os.environ.get("BYBIT_API_SECRET", "")
+        self.api_key        = os.environ.get("OKX_API_KEY", "")
+        self.api_secret     = os.environ.get("OKX_API_SECRET", "")
+        self.api_passphrase = os.environ.get("OKX_PASSPHRASE", "")
         self._http: Optional[httpx.AsyncClient] = None
 
     def _client(self) -> httpx.AsyncClient:
         if self._http is None or self._http.is_closed:
-            self._http = httpx.AsyncClient(base_url=BYBIT_BASE, timeout=10.0)
+            self._http = httpx.AsyncClient(base_url=OKX_BASE, timeout=10.0)
         return self._http
 
-    def _sign(self, timestamp: int, body_str: str) -> dict:
-        recv = "5000"
-        msg = f"{timestamp}{self.api_key}{recv}{body_str}"
-        sig = hmac.new(self.api_secret.encode(), msg.encode(), hashlib.sha256).hexdigest()
+    def _sign(self, method: str, path: str, body: str = "") -> dict:
+        ts = str(time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime()))
+        msg = ts + method.upper() + path + body
+        sig = base64.b64encode(
+            hmac.new(self.api_secret.encode(), msg.encode(), hashlib.sha256).digest()
+        ).decode()
         return {
-            "X-BAPI-API-KEY":      self.api_key,
-            "X-BAPI-SIGN":         sig,
-            "X-BAPI-TIMESTAMP":    str(timestamp),
-            "X-BAPI-RECV-WINDOW":  recv,
+            "OK-ACCESS-KEY":        self.api_key,
+            "OK-ACCESS-SIGN":       sig,
+            "OK-ACCESS-TIMESTAMP":  ts,
+            "OK-ACCESS-PASSPHRASE": self.api_passphrase,
+            "Content-Type":         "application/json",
         }
 
     # ── Public endpoints ──────────────────────────────────────────────────────
 
     async def get_price(self, symbol: str) -> Optional[float]:
         try:
-            r = await self._client().get("/v5/market/tickers",
-                params={"category": "linear", "symbol": _sym(symbol)})
-            lst = r.json().get("result", {}).get("list", [])
-            return float(lst[0]["lastPrice"]) if lst else None
+            r = await self._client().get("/api/v5/market/ticker",
+                params={"instId": _sym(symbol)})
+            data = r.json().get("data", [])
+            return float(data[0]["last"]) if data else None
         except Exception as e:
             log.warning(f"get_price {symbol}: {e}")
         return None
 
     async def get_all_prices(self) -> dict[str, float]:
         try:
-            r = await self._client().get("/v5/market/tickers", params={"category": "linear"})
+            r = await self._client().get("/api/v5/market/tickers",
+                params={"instType": "SWAP"})
             out = {}
-            for item in r.json().get("result", {}).get("list", []):
-                s = item.get("symbol", "")
-                if s.endswith("USDT"):
-                    out[s[:-4]] = float(item["lastPrice"])
+            for item in r.json().get("data", []):
+                inst = item.get("instId", "")
+                if inst.endswith("-USDT-SWAP"):
+                    coin = inst.replace("-USDT-SWAP", "")
+                    out[coin] = float(item["last"])
             return out
         except Exception as e:
             log.warning(f"get_all_prices: {e}")
@@ -71,15 +80,18 @@ class BybitClient:
 
     async def get_all_price_changes(self, symbols: list[str]) -> dict[str, float]:
         try:
-            r = await self._client().get("/v5/market/tickers", params={"category": "linear"})
-            sym_set = {s + "USDT" for s in symbols}
+            r = await self._client().get("/api/v5/market/tickers",
+                params={"instType": "SWAP"})
+            sym_set = {f"{s}-USDT-SWAP" for s in symbols}
             out = {}
-            for item in r.json().get("result", {}).get("list", []):
-                s = item.get("symbol", "")
-                if s in sym_set:
-                    pct = item.get("price24hPcnt")
-                    if pct is not None:
-                        out[s[:-4]] = round(float(pct) * 100, 2)
+            for item in r.json().get("data", []):
+                inst = item.get("instId", "")
+                if inst in sym_set:
+                    last  = float(item.get("last",    0) or 0)
+                    open_ = float(item.get("open24h", last) or last)
+                    if open_ > 0:
+                        coin = inst.replace("-USDT-SWAP", "")
+                        out[coin] = round((last - open_) / open_ * 100, 2)
             return out
         except Exception as e:
             log.warning(f"get_all_price_changes: {e}")
@@ -87,14 +99,13 @@ class BybitClient:
 
     async def get_candles(self, symbol: str, interval: str, limit: int = 50) -> list[dict]:
         try:
-            r = await self._client().get("/v5/market/kline", params={
-                "category": "linear",
-                "symbol":   _sym(symbol),
-                "interval": _tf(interval),
-                "limit":    limit,
+            r = await self._client().get("/api/v5/market/candles", params={
+                "instId": _sym(symbol),
+                "bar":    _tf(interval),
+                "limit":  limit,
             })
-            raw = r.json().get("result", {}).get("list", [])
-            # Bybit returns [startTime, open, high, low, close, volume, turnover], newest first
+            raw = r.json().get("data", [])
+            # OKX returns [ts, open, high, low, close, vol, volCcy, volCcyQuote, confirm], newest first
             candles = []
             for row in reversed(raw):
                 candles.append({
@@ -112,14 +123,13 @@ class BybitClient:
 
     async def get_orderbook(self, symbol: str, depth: int = 20) -> dict:
         try:
-            r = await self._client().get("/v5/market/orderbook", params={
-                "category": "linear",
-                "symbol":   _sym(symbol),
-                "limit":    depth,
+            r = await self._client().get("/api/v5/market/books", params={
+                "instId": _sym(symbol),
+                "sz":     depth,
             })
-            res = r.json().get("result", {})
-            bid_vol = sum(float(b[1]) for b in res.get("b", []))
-            ask_vol = sum(float(a[1]) for a in res.get("a", []))
+            res = r.json().get("data", [{}])[0]
+            bid_vol = sum(float(b[1]) for b in res.get("bids", []))
+            ask_vol = sum(float(a[1]) for a in res.get("asks", []))
             total = bid_vol + ask_vol
             if total == 0:
                 return {"bid_pct": 50.0, "ask_pct": 50.0, "total_vol": 0}
@@ -134,11 +144,10 @@ class BybitClient:
 
     async def get_funding_rate(self, symbol: str) -> Optional[float]:
         try:
-            r = await self._client().get("/v5/market/funding/history", params={
-                "category": "linear", "symbol": _sym(symbol), "limit": 1,
-            })
-            lst = r.json().get("result", {}).get("list", [])
-            return float(lst[0].get("fundingRate", 0)) if lst else None
+            r = await self._client().get("/api/v5/public/funding-rate",
+                params={"instId": _sym(symbol)})
+            data = r.json().get("data", [])
+            return float(data[0].get("fundingRate", 0)) if data else None
         except Exception as e:
             log.warning(f"get_funding_rate {symbol}: {e}")
         return None
@@ -147,14 +156,11 @@ class BybitClient:
 
     async def get_open_position_size(self, symbol: str):
         try:
-            ts = int(time.time() * 1000)
-            params = f"category=linear&symbol={_sym(symbol)}"
-            headers = {**self._sign(ts, params), "Content-Type": "application/json"}
-            r = await self._client().get("/v5/position/list",
-                params={"category": "linear", "symbol": _sym(symbol)},
-                headers=headers)
-            for pos in r.json().get("result", {}).get("list", []):
-                sz = float(pos.get("size", 0))
+            path = f"/api/v5/account/positions?instId={_sym(symbol)}"
+            r = await self._client().get(path,
+                headers=self._sign("GET", path))
+            for pos in r.json().get("data", []):
+                sz = float(pos.get("pos", 0))
                 if sz > 0:
                     return sz
         except Exception as e:
@@ -171,25 +177,22 @@ class BybitClient:
         leverage: int = 5,
     ) -> dict:
         try:
-            ts = int(time.time() * 1000)
+            path = "/api/v5/trade/order"
             body: dict = {
-                "category":      "linear",
-                "symbol":        _sym(symbol),
-                "side":          "Buy" if direction == "LONG" else "Sell",
-                "orderType":     "Market",
-                "qty":           str(size),
-                "stopLoss":      str(round(sl_price, 6)),
-                "slTriggerBy":   "LastPrice",
-                "timeInForce":   "IOC",
-                "reduceOnly":    False,
-                "closeOnTrigger": False,
+                "instId":    _sym(symbol),
+                "tdMode":    "cross",
+                "side":      "buy" if direction == "LONG" else "sell",
+                "ordType":   "market",
+                "sz":        str(size),
+                "slTriggerPx": str(round(sl_price, 6)),
+                "slOrdPx":     "-1",
             }
             if tp_price:
-                body["takeProfit"] = str(round(tp_price, 6))
-                body["tpTriggerBy"] = "LastPrice"
+                body["tpTriggerPx"] = str(round(tp_price, 6))
+                body["tpOrdPx"]     = "-1"
             body_str = json.dumps(body)
-            headers = {**self._sign(ts, body_str), "Content-Type": "application/json"}
-            r = await self._client().post("/v5/order/create", content=body_str, headers=headers)
+            r = await self._client().post(path, content=body_str,
+                headers=self._sign("POST", path, body_str))
             return r.json()
         except Exception as e:
             log.warning(f"open_position {symbol} {direction}: {e}")
@@ -197,19 +200,17 @@ class BybitClient:
 
     async def close_position(self, symbol: str, direction: str, size: float) -> dict:
         try:
-            ts = int(time.time() * 1000)
+            path = "/api/v5/trade/order"
             body_str = json.dumps({
-                "category":      "linear",
-                "symbol":        _sym(symbol),
-                "side":          "Sell" if direction == "LONG" else "Buy",
-                "orderType":     "Market",
-                "qty":           str(size),
-                "timeInForce":   "IOC",
-                "reduceOnly":    True,
-                "closeOnTrigger": True,
+                "instId":  _sym(symbol),
+                "tdMode":  "cross",
+                "side":    "sell" if direction == "LONG" else "buy",
+                "ordType": "market",
+                "sz":      str(size),
+                "reduceOnly": "true",
             })
-            headers = {**self._sign(ts, body_str), "Content-Type": "application/json"}
-            r = await self._client().post("/v5/order/create", content=body_str, headers=headers)
+            r = await self._client().post(path, content=body_str,
+                headers=self._sign("POST", path, body_str))
             return r.json()
         except Exception as e:
             log.warning(f"close_position {symbol} {direction}: {e}")
@@ -217,14 +218,10 @@ class BybitClient:
 
     async def cancel_order(self, coin: str, order_id: str) -> dict:
         try:
-            ts = int(time.time() * 1000)
-            body_str = json.dumps({
-                "category": "linear",
-                "symbol":   _sym(coin),
-                "orderId":  order_id,
-            })
-            headers = {**self._sign(ts, body_str), "Content-Type": "application/json"}
-            r = await self._client().post("/v5/order/cancel", content=body_str, headers=headers)
+            path = "/api/v5/trade/cancel-order"
+            body_str = json.dumps({"instId": _sym(coin), "ordId": order_id})
+            r = await self._client().post(path, content=body_str,
+                headers=self._sign("POST", path, body_str))
             return r.json()
         except Exception as e:
             return {"error": str(e)}
