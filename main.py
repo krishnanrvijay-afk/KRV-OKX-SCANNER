@@ -41,7 +41,7 @@ from config import (
 )
 from supabase import create_client, Client
 import sentinel as _sentinel_mod
-from bybit_client import BybitClient
+from okx_client import OkxClient
 from scanner import (
     run_full_scan, scan_pair_state,
     get_scan_count, set_close_cooldown, clear_cooldown,
@@ -273,7 +273,7 @@ class AppState:
 
 
 app_state  = AppState()
-bybit_client: Optional[BybitClient] = None
+okx_client: Optional[OkxClient] = None
 
 
 # Ã¢ÂÂÃ¢ÂÂ Helpers Ã¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂ
@@ -389,7 +389,7 @@ def _load_state():
                     "pnl_usd":          float(row.get("pnl_dollars") or 0),
                     "r_value":          float(row.get("r_value") or 0),
                     "duration_seconds": int(row.get("duration_seconds") or 0),
-                    "exchange":         row.get("exchange", "BYBIT"),
+                    "exchange":         row.get("exchange", "OKX"),
                     "session_opened":   row.get("session_opened"),
                     "mae_r":            float(row.get("mae_r")) if row.get("mae_r") is not None else None,
                     "mfe_r":            float(row.get("mfe_r")) if row.get("mfe_r") is not None else None,
@@ -649,7 +649,7 @@ def _append_trade_log(trade: dict, exit_price: float, reason: str, pnl: float, r
         "pnl_usd":          round(pnl, 2),
         "r_value":          r,
         "duration_seconds": now_ts - opened_at,
-        "exchange":         trade.get("exchange", "BYBIT"),
+        "exchange":         trade.get("exchange", "OKX"),
         "paper":            trade.get("paper", True),
         "session_opened":   _session,
         "mae_r":            _mae_r,
@@ -669,7 +669,7 @@ def _append_trade_log(trade: dict, exit_price: float, reason: str, pnl: float, r
                 "direction":        trade["direction"],
                 "tier":             trade.get("tier"),
                 "leverage":         trade.get("leverage"),
-                "exchange":         trade.get("exchange", "BYBIT"),
+                "exchange":         trade.get("exchange", "OKX"),
                 "entry_price":      trade.get("entry_price"),
                 "exit_price":       exit_price,
                 "sl":               trade.get("sl_price"),
@@ -778,7 +778,7 @@ async def _open_trade_log_row(trade: dict):
             "direction":       trade["direction"],
             "tier":            trade.get("tier"),
             "leverage":        trade.get("leverage"),
-            "exchange": "BYBIT",
+            "exchange": "OKX",
             "entry_price":     trade.get("entry_price"),
             "sl":              trade.get("sl_price"),
             "tp1":             trade.get("tp1_price"),
@@ -897,7 +897,7 @@ async def _do_open_trade(
                       f"blocked duplicate open: {_lock_e}")
                 return None, "already_open"
 
-    _client = bybit_client
+    _client = okx_client
     sl_price = alert_data.get("sl_price") if alert_data else None
     result   = await _client.open_position(
         symbol, direction, margin_usdc, leverage, sl_price=sl_price
@@ -1253,7 +1253,7 @@ async def _scan_loop():
                 await asyncio.sleep(
                     SCAN_INTERVAL_SECONDS)
                 continue
-            _scan_result = await run_full_scan(bybit_client, market_health=app_state.market_health, open_trades=app_state.open_trades)
+            _scan_result = await run_full_scan(okx_client, market_health=app_state.market_health, open_trades=app_state.open_trades)
             new_alerts, _pair_states = _scan_result if isinstance(_scan_result, tuple) else (_scan_result, [])
             # -- BTC flash TG alert -- fires once per flash event when block arms --------
             if _scanner_mod._btc_flash_tg_pending[0]:
@@ -1288,7 +1288,7 @@ async def _scan_loop():
                     print(f"[SESSION RESET] dir-halt clear failed: {_sr_e}")
             _prev_session = _curr_sess
             app_state.last_scan_at = int(time.time())
-            app_state.pair_states  = _pair_states if _pair_states else await scan_pair_state(bybit_client)
+            app_state.pair_states  = _pair_states if _pair_states else await scan_pair_state(okx_client)
             app_state.market_health = compute_market_health(
                 app_state.pair_states, list(app_state.trade_log)
             )
@@ -1402,7 +1402,7 @@ async def _scan_loop():
                         sym, dir_,
                         _margin, alert["leverage"],
                         alert_data=alert,
-                        exchange="BYBIT",
+                        exchange="OKX",
                     )
                     if trade:
                         print(
@@ -1432,7 +1432,7 @@ async def _price_loop():
     _chg_tick = 0
     while True:
         try:
-            all_prices = await bybit_client.get_all_prices()
+            all_prices = await okx_client.get_all_prices()
             if not all_prices:
                 print("[PRICE] get_all_prices returned empty -- skipping price update")
             else:
@@ -1445,7 +1445,7 @@ async def _price_loop():
             _chg_tick += 1
             if _chg_tick >= 5:
                 _chg_tick = 0
-                changes = await bybit_client.get_all_price_changes(PAIRS)
+                changes = await okx_client.get_all_price_changes(PAIRS)
                 if changes:
                     app_state.price_changes.update(changes)
 
@@ -2022,7 +2022,7 @@ async def _exit_monitor_loop():
                           f"{_px_age:.0f}s — attempting direct refetch")
                     _fresh_px = None
                     try:
-                        _all = await bybit_client.get_all_prices()
+                        _all = await okx_client.get_all_prices()
                         _fresh_px = _all.get(sym)
                     except Exception as _refetch_e:
                         print(f"[STALE PRICE] {sym} refetch failed: {_refetch_e!r}")
@@ -2038,7 +2038,7 @@ async def _exit_monitor_loop():
                 # -- External close detection (every 5 ticks) ─────────────────
                 if not PAPER_MODE and _extclose_tick % 5 == 0:
                     try:
-                        _exsz = await bybit_client.get_open_position_size(sym)
+                        _exsz = await okx_client.get_open_position_size(sym)
                         if _exsz is not None and _exsz == 0:
                             print(f"[EXTERNAL_CLOSE] {sym} {direction} "
                                   f"— position gone on exchange, logging close")
@@ -2867,7 +2867,7 @@ async def _process_pending_alerts():
                 _sym, _dir,
                 _margin, _alert["leverage"],
                 alert_data=_alert,
-                exchange="BYBIT",
+                exchange="OKX",
             )
             if trade:
                 print(
@@ -2892,8 +2892,8 @@ async def _process_pending_alerts():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global bybit_client
-    bybit_client = BybitClient()
+    global okx_client
+    okx_client = OkxClient()
     log_startup_config()
     _load_state()
     if _pending_alerts:
@@ -2935,7 +2935,7 @@ async def lifespan(app: FastAPI):
     state_task.cancel()
     if _digest_task is not None and not _digest_task.done():
         _digest_task.cancel()
-    await bybit_client.close()
+    await okx_client.close()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -3222,8 +3222,8 @@ async def close_trade(req: CloseTradeRequest):
     if not trade:
         raise HTTPException(status_code=404, detail=f"No open trade for {key}")
 
-    exchange = trade.get("exchange", "BYBIT")
-    _client  = bybit_client
+    exchange = trade.get("exchange", "OKX")
+    _client  = okx_client
     result   = await _client.close_position(req.symbol, req.direction, trade["size"])
     if result.get("status") != "ok":
         raise HTTPException(status_code=500, detail=result.get("msg", "close failed"))
@@ -3232,10 +3232,10 @@ async def close_trade(req: CloseTradeRequest):
     if not close_price or close_price <= 0:
         print(f"[CLOSE GUARD] {req.symbol} -- price feed returned {close_price!r}, attempting fresh fetch")
         try:
-            close_price = await bybit_client.get_price(req.symbol)
+            close_price = await okx_client.get_price(req.symbol)
             if not close_price or close_price <= 0:
                 await asyncio.sleep(2)
-                close_price = await bybit_client.get_price(req.symbol)
+                close_price = await okx_client.get_price(req.symbol)
         except Exception as _pe:
             print(f"[CLOSE GUARD] {req.symbol} fresh price fetch failed: {_pe}")
             close_price = None
@@ -3846,10 +3846,10 @@ async def clear_tradelog(
         ep = app_state.prices.get(sym) or 0
         if not ep or ep <= 0:
             try:
-                ep = await bybit_client.get_price(sym)
+                ep = await okx_client.get_price(sym)
                 if not ep or ep <= 0:
                     await asyncio.sleep(2)
-                    ep = await bybit_client.get_price(sym)
+                    ep = await okx_client.get_price(sym)
             except Exception:
                 ep = None
         if not ep or ep <= 0:
